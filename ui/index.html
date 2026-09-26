@@ -29,6 +29,17 @@
           <select id="f-model"></select>
         </label>
         <label class="field">
+          <span>推理强度</span>
+          <select id="f-effort">
+            <option value="">自动（模型默认）</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <label class="field">
           <span>上游账号</span>
           <select id="f-account"></select>
         </label>
@@ -64,6 +75,17 @@
             <option value="24" selected>24 条</option>
             <option value="48">48 条</option>
             <option value="64">64 条</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>默认推理强度</span>
+          <select id="f-def-effort">
+            <option value="" selected>自动（模型默认）</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
           </select>
         </label>
       </div>

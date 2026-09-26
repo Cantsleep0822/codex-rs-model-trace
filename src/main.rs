@@ -199,12 +199,17 @@ async fn models(call: &ManagementCall, query: &str) -> ManagementResult {
     }
 }
 
+/// 允许透传的推理强度；`auto` 在页面上表示不写字段。
+const REASONING_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
 #[derive(Debug, Deserialize)]
 struct CreateRequest {
     model: String,
     client_key_id: String,
     #[serde(default)]
     client_key_name: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     #[serde(default)]
     account_id: Option<String>,
     #[serde(default)]
@@ -242,6 +247,15 @@ async fn create_run(app: &App, call: &ManagementCall) -> ManagementResult {
     if request.client_key_id.is_empty() || request.client_key_id.len() > 128 {
         return json_response(400, json!({"error": "client_key_id is required"}));
     }
+    if let Some(effort) = &request.reasoning_effort
+        && !effort.is_empty()
+        && !REASONING_EFFORTS.contains(&effort.as_str())
+    {
+        return json_response(
+            400,
+            json!({"error": "reasoning_effort must be low|medium|high|xhigh|max"}),
+        );
+    }
     if request.queries.is_empty() || request.queries.len() > MAX_QUERIES {
         return json_response(
             400,
@@ -272,6 +286,7 @@ async fn create_run(app: &App, call: &ManagementCall) -> ManagementResult {
         model: request.model,
         client_key_id: request.client_key_id,
         client_key_name: request.client_key_name.filter(|name| !name.is_empty()),
+        reasoning_effort: request.reasoning_effort.filter(|effort| !effort.is_empty()),
         account_id: request.account_id.filter(|id| !id.is_empty()),
         provider: request.provider.filter(|id| !id.is_empty()),
         account_name: request.account_name.filter(|name| !name.is_empty()),
@@ -412,6 +427,7 @@ async fn step_run(call: &ManagementCall) -> ManagementResult {
             &run.model,
             run.provider.as_deref(),
             run.account_id.as_deref(),
+            run.reasoning_effort.as_deref(),
             &prompt,
         )
         .await;

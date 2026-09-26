@@ -20,7 +20,8 @@
     stepInFlight: false,
     stepSentAt: 0,
     lastViewedRun: null,
-    settings: { challenge_count: 3, history_limit: 24 },
+    settings: { challenge_count: 3, history_limit: 24, default_effort: null },
+    pollTimer: null,
   };
 
   // 桥 invoke 超时是 30s，而管理调用最长约 120s；步骤调用可能先超时再由后端落盘。
@@ -105,8 +106,11 @@
     if (!settings) return;
     if (settings.challenge_count) state.settings.challenge_count = settings.challenge_count;
     if (settings.history_limit) state.settings.history_limit = settings.history_limit;
+    if ('default_effort' in settings) state.settings.default_effort = settings.default_effort;
     $('f-count').value = String(state.settings.challenge_count);
     $('f-history').value = String(state.settings.history_limit);
+    $('f-def-effort').value = state.settings.default_effort || '';
+    if (!$('f-effort').value) $('f-effort').value = state.settings.default_effort || '';
   }
 
   function settingsHint(message, kind) {
@@ -130,6 +134,7 @@
       var data = await call('POST', 'settings', undefined, {
         challenge_count: Number($('f-count').value),
         history_limit: Number($('f-history').value),
+        default_effort: $('f-def-effort').value || null,
       });
       applySettings(data.settings);
       settingsHint('已保存，立即生效。', 'ok');
@@ -239,6 +244,7 @@
         model: model,
         client_key_id: keyId,
         client_key_name: keyName || null,
+        reasoning_effort: $('f-effort').value || null,
         account_id: account ? account.account_id : null,
         provider: account ? account.provider_id : null,
         account_name: account ? (account.name || null) : null,
@@ -393,6 +399,7 @@
       ['执行 Key', run.client_key_name || run.client_key_id || '—'],
       ['模型', run.model],
       ['上游账号', account + (run.provider ? '（' + run.provider + '）' : '')],
+      ['推理强度', run.reasoning_effort || '自动'],
       ['状态', run.status],
       ['归因', prediction],
       ['更新于', formatTime(run.updated_at_ms)],

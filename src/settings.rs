@@ -16,7 +16,8 @@ const MIN_HISTORY_LIMIT: usize = 4;
 const MAX_HISTORY_LIMIT: usize = 64;
 
 /// 当前生效设置；历史展示条数仅影响渲染，不改命名空间保存上限。
-fn normalize(settings: &Value) -> (u32, usize) {
+/// `default_effort` 允许 low|medium|high|xhigh|max，非法值按未设置处理。
+fn normalize(settings: &Value) -> (u32, usize, Option<String>) {
     let challenge_count = settings
         .get("challenge_count")
         .and_then(Value::as_u64)
@@ -29,14 +30,20 @@ fn normalize(settings: &Value) -> (u32, usize) {
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
-    (challenge_count, history_limit)
+    let default_effort = settings
+        .get("default_effort")
+        .and_then(Value::as_str)
+        .filter(|effort| ["low", "medium", "high", "xhigh", "max"].contains(effort))
+        .map(str::to_owned);
+    (challenge_count, history_limit, default_effort)
 }
 
 fn settings_json(settings: &Value) -> Value {
-    let (challenge_count, history_limit) = normalize(settings);
+    let (challenge_count, history_limit, default_effort) = normalize(settings);
     json!({
         "challenge_count": challenge_count,
         "history_limit": history_limit,
+        "default_effort": default_effort,
     })
 }
 
@@ -63,7 +70,7 @@ pub async fn save(call: &ManagementCall) -> ManagementResult {
         .map(|(value, version)| (value, Some(version)))
         .unwrap_or((json!({}), None));
     let mut merged = current;
-    for key in ["challenge_count", "history_limit"] {
+    for key in ["challenge_count", "history_limit", "default_effort"] {
         if let Some(value) = body.get(key)
             && !value.is_null()
         {
@@ -102,6 +109,7 @@ pub async fn reset(host: &HostClient) -> ManagementResult {
             "settings": {
                 "challenge_count": DEFAULT_CHALLENGE_COUNT,
                 "history_limit": DEFAULT_HISTORY_LIMIT,
+                "default_effort": null,
             }
         }),
     )

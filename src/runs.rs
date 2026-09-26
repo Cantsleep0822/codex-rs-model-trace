@@ -67,6 +67,9 @@ pub struct RunState {
     pub client_key_id: String,
     #[serde(default)]
     pub client_key_name: Option<String>,
+    /// 推理强度透传到 `reasoning.effort`；`None` 走模型默认。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub account_id: Option<String>,
     pub provider: Option<String>,
     pub account_name: Option<String>,

@@ -138,12 +138,14 @@ pub async fn list_models(
 
 /// 非流式生成调用；返回正文文本与用量事实。
 /// `account_id` 为 `None` 时交给宿主正常调度，否则收窄到指定账号。
+/// `reasoning_effort` 为 `None` 时不写 `reasoning` 字段，走模型默认推理强度。
 pub async fn generate(
     host: &HostClient,
     client_key_id: &str,
     model: &str,
     provider: Option<&str>,
     account_id: Option<&str>,
+    reasoning_effort: Option<&str>,
     prompt: &str,
 ) -> Result<GenerateOutcome, PluginFault> {
     let request = ModelExecuteRequest {
@@ -155,11 +157,14 @@ pub async fn generate(
         account_id: account_id.map(str::to_owned),
         previous_response_id: None,
     };
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "input": prompt,
         "store": false,
     });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = serde_json::json!({"effort": effort});
+    }
     let reply = host
         .call(
             "host.model.execute",

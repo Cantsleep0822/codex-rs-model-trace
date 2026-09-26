@@ -240,7 +240,8 @@ fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "cancelled" | "failed")
 }
 
-/// 不可重试的模型调用错误：配额、账号或权限问题继续尝试只会浪费额度。
+/// 不可重试的模型调用错误：权限、策略拒绝或协议不支持，继续尝试不会好转。
+/// `Capacity`（含额度耗尽/限流）保留有界重试，最后一次失败会终止运行。
 fn is_permanent(fault: &PluginFault) -> bool {
     match fault.code {
         ErrorCode::PermissionDenied

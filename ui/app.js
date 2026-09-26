@@ -20,6 +20,9 @@
     stepInFlight: false,
     stepSentAt: 0,
     lastViewedRun: null,
+    detailRunId: null,
+    detailRun: null,
+    detailTab: 'meta',
     settings: { challenge_count: 3, history_limit: 24, default_effort: null },
     pollTimer: null,
   };
@@ -356,14 +359,21 @@
   }
 
   async function showDetail(id) {
+    if (state.detailRunId === id) {
+      state.detailRunId = null;
+      state.detailRun = null;
+      renderHistory(state.runsCache || []);
+      return;
+    }
     try {
       var data = await call('GET', 'run', 'id=' + encodeURIComponent(id));
       if (!data.run) throw new Error('运行不存在');
-      renderRunDetail(data.run);
-      if (data.run.result) {
-        state.lastViewedRun = data.run;
-        renderResult(data.run.result);
-      }
+      state.detailRunId = id;
+      state.detailRun = data.run;
+      state.detailTab = 'meta';
+      state.lastViewedRun = data.run;
+      renderHistory(state.runsCache || []);
+      if (data.run.result) renderResult(data.run.result);
     } catch (error) {
       toast('打开详情失败：' + error.message, 'fail');
     }
@@ -383,15 +393,11 @@
   }
 
   function renderRunDetail(run) {
-    show('detail-modal', true);
     var account = run.account_name || run.account_id || '自动';
     var prediction = run.result
       ? (run.result.prediction_name || run.result.prediction || '—')
         + '（' + formatPercent(run.result.probability) + '）'
       : '—';
-    setText('detail-sub', '运行 ' + run.id + ' · 创建于 ' + formatTime(run.created_at_ms));
-
-    var meta = $('detail-meta');
     var fields = [
       ['执行 Key', run.client_key_name || run.client_key_id || '—'],
       ['模型', run.model],
@@ -401,41 +407,64 @@
       ['归因', prediction],
       ['更新于', formatTime(run.updated_at_ms)],
     ];
-    meta.innerHTML = fields.map(function (field) {
+    var verdict = '';
+    if (run.result) {
+      verdict = '<div class="detail-verdict"><span class="verdict">'
+        + escapeHtml(run.result.prediction_name || run.result.prediction || '—') + '</span>'
+        + '<span class="sub">概率 ' + formatPercent(run.result.probability)
+        + ' · 家族 ' + escapeHtml(run.result.family_prediction_name || run.result.family_prediction || '—')
+        + '（' + formatPercent(run.result.family_probability) + '）'
+        + ' · 计入 ' + (run.result.used_outputs || 0) + ' 道挑战</span></div>';
+    }
+    return verdict + '<dl class="meta-grid">' + fields.map(function (field) {
       return '<div><div class="m-label">' + escapeHtml(field[0]) + '</div>'
         + '<div class="m-value">' + escapeHtml(field[1]) + '</div></div>';
-    }).join('');
+    }).join('') + '</dl>';
+  }
 
-    var container = $('detail-queries');
-    container.innerHTML = '';
+  function renderQueryDetail(query, index) {
+    var attemptsRows = (query.attempts || []).map(function (attempt) {
+      return '<tr><td class="mono">' + attempt.index + '</td>'
+        + '<td>' + statusTag(attempt.status) + '</td>'
+        + '<td>' + escapeHtml(attemptCell(attempt)) + '</td>'
+        + '<td class="mono detail-preview">' + escapeHtml(attempt.text_preview || '—') + '</td></tr>';
+    }).join('');
+    if (!attemptsRows) {
+      attemptsRows = '<tr><td colspan="4" class="empty">尚无调用</td></tr>';
+    }
+    var numbers = query.numbers && query.numbers.length
+      ? '<h4 class="block-title">解析数字（' + query.numbers.length + ' 个）</h4>'
+        + '<pre class="numbers-text mono">' + escapeHtml(query.numbers.join(', ')) + '</pre>'
+      : '';
+    return '<div class="dq-meta">目标 ' + query.expected_count + ' 个数字 · 尝试 '
+      + (query.attempts || []).length + ' 次 · ' + statusTag(query.status) + '</div>'
+      + '<h4 class="block-title">请求 Prompt</h4>'
+      + '<pre class="prompt-text">' + escapeHtml(query.prompt) + '</pre>'
+      + '<div class="table-wrap" style="margin-top:8px"><table class="table compact">'
+      + '<thead><tr><th>次数</th><th>结果</th><th>明细</th><th>回答预览</th></tr></thead>'
+      + '<tbody>' + attemptsRows + '</tbody></table></div>'
+      + numbers;
+  }
+
+  function renderDetailPane() {
+    var run = state.detailRun;
+    if (!run) return '';
+    var tabs = ['<button class="tab' + (state.detailTab === 'meta' ? ' active' : '')
+      + '" data-tab="meta">概览</button>'];
     run.queries.forEach(function (query, index) {
-      var block = document.createElement('div');
-      block.className = 'detail-query';
-      var attemptsRows = (query.attempts || []).map(function (attempt) {
-        return '<tr><td class="mono">' + attempt.index + '</td>'
-          + '<td>' + statusTag(attempt.status) + '</td>'
-          + '<td>' + escapeHtml(attemptCell(attempt)) + '</td>'
-          + '<td class="mono">' + escapeHtml(attempt.text_preview || '—') + '</td></tr>';
-      }).join('');
-      if (!attemptsRows) {
-        attemptsRows = '<tr><td colspan="4" class="empty">尚无调用</td></tr>';
-      }
-      var numbers = query.numbers && query.numbers.length
-        ? '<h4 class="block-title">解析数字（' + query.numbers.length + ' 个）</h4>'
-          + '<pre class="numbers-text mono">' + escapeHtml(query.numbers.join(', ')) + '</pre>'
-        : '';
-      block.innerHTML = '<div class="dq-head"><span class="dq-title">挑战 ' + (index + 1) + '</span>'
-        + statusTag(query.status) + '</div>'
-        + '<div class="dq-meta">目标 ' + query.expected_count + ' 个数字 · 尝试 '
-        + (query.attempts || []).length + ' 次</div>'
-        + '<h4 class="block-title">请求 Prompt</h4>'
-        + '<pre class="prompt-text">' + escapeHtml(query.prompt) + '</pre>'
-        + '<div class="table-wrap" style="margin-top:8px"><table class="table compact">'
-        + '<thead><tr><th>次数</th><th>结果</th><th>明细</th><th>回答预览</th></tr></thead>'
-        + '<tbody>' + attemptsRows + '</tbody></table></div>'
-        + numbers;
-      container.appendChild(block);
+      var key = 'q' + index;
+      tabs.push('<button class="tab' + (state.detailTab === key ? ' active' : '')
+        + '" data-tab="' + key + '">挑战 ' + (index + 1) + '</button>');
     });
+    var pane;
+    if (state.detailTab === 'meta') {
+      pane = renderRunDetail(run);
+    } else {
+      var index = Number(state.detailTab.slice(1));
+      pane = run.queries[index] ? renderQueryDetail(run.queries[index], index) : '';
+    }
+    return '<div class="detail-tabs">' + tabs.join('') + '</div>'
+      + '<div class="detail-pane">' + pane + '</div>';
   }
 
   async function resumeRun(id) {
@@ -609,23 +638,28 @@
   }
 
   function renderHistory(runs) {
+    state.runsCache = runs;
     var body = $('history-body');
     body.innerHTML = '';
     var limit = state.settings.history_limit || runs.length;
     var shown = runs.slice(0, limit);
     if (!shown.length) {
+      state.detailRunId = null;
+      state.detailRun = null;
       body.innerHTML = '<tr><td colspan="7" class="empty">暂无记录</td></tr>';
       return;
     }
     setText('history-sub', '最近 ' + shown.length + ' / ' + runs.length + ' 次检测，点开可查看请求与回答明细。');
     shown.forEach(function (run) {
       var row = document.createElement('tr');
+      var expanded = state.detailRunId === run.id;
       var account = run.account_name || run.account_id || '自动';
       var prediction = run.prediction
         ? escapeHtml(run.prediction) + '（' + formatPercent(run.probability) + '）'
         : '—';
       var finished = ['completed', 'cancelled', 'failed'].includes(run.status);
-      var actions = '<button class="btn link" data-detail="' + escapeHtml(run.id) + '">查看</button>';
+      var actions = '<button class="btn link" data-detail="' + escapeHtml(run.id) + '">'
+        + (expanded ? '收起' : '查看') + '</button>';
       if (!finished) {
         actions += ' · <button class="btn link" data-open="' + escapeHtml(run.id) + '">继续</button>';
       }
@@ -638,6 +672,13 @@
         + '<td>' + prediction + '</td>'
         + '<td>' + actions + '</td>';
       body.appendChild(row);
+      if (expanded) {
+        var detail = document.createElement('tr');
+        detail.className = 'history-detail';
+        detail.innerHTML = '<td colspan="7"><div class="detail-inline">'
+          + renderDetailPane() + '</div></td>';
+        body.appendChild(detail);
+      }
     });
   }
 
@@ -667,13 +708,20 @@
     $('history-refresh').addEventListener('click', function () { void loadHistory(); });
     $('settings-save').addEventListener('click', function () { void saveSettings(); });
     $('settings-reset').addEventListener('click', function () { void resetSettings(); });
-    $('detail-close').addEventListener('click', function () { show('detail-modal', false); });
-    $('detail-modal').addEventListener('click', function (event) {
-      if (event.target === $('detail-modal')) show('detail-modal', false);
+    $('settings-open').addEventListener('click', function () { show('settings-modal', true); });
+    $('settings-close').addEventListener('click', function () { show('settings-modal', false); });
+    $('settings-modal').addEventListener('click', function (event) {
+      if (event.target === $('settings-modal')) show('settings-modal', false);
     });
     $('history-body').addEventListener('click', function (event) {
       var target = event.target;
       if (!(target instanceof HTMLElement)) return;
+      var tab = target.getAttribute('data-tab');
+      if (tab) {
+        state.detailTab = tab;
+        renderHistory(state.runsCache || []);
+        return;
+      }
       var detail = target.getAttribute('data-detail');
       var open = target.getAttribute('data-open');
       var del = target.getAttribute('data-delete');

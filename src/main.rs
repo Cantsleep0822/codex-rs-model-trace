@@ -1,0 +1,671 @@
+//! ModelTrace 模型指纹检测插件：管理页面 + 分步执行的三条数字指纹挑战。
+
+mod model;
+mod parse;
+mod runs;
+mod settings;
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use gateway_plugin_sdk::{
+    ErrorCode, PluginFault,
+    call::{
+        host::{StateDeleteRequest, StateDeleteResult},
+        management::{ManagementPage, ManagementRegistration, ManagementResource, ManagementRoute},
+    },
+    client::{HostClient, PluginBuilder, SessionConfig, TypedCall, TypedReply},
+};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::runs::{AttemptRecord, QueryState, RunIndexEntry, RunState};
+
+/// 挑战长度约定与指纹算法一致：1–355 的整数序列，每题 100–400 个。
+const MIN_EXPECTED_COUNT: u32 = 100;
+const MAX_EXPECTED_COUNT: u32 = 400;
+const MAX_QUERIES: usize = 3;
+const MAX_PROMPT_BYTES: usize = 8 * 1024;
+/// 回答文本短预览长度；完整序列按数字保存，不回显原始输出。
+const TEXT_PREVIEW_CHARS: usize = 240;
+/// 原始输出持久化上限，超出截断保留前缀。
+const RESPONSE_TEXT_BYTES: usize = 16 * 1024;
+/// 状态写入冲突时的最大重试轮数（步骤调用 + 结果落盘两段 CAS）。
+const MAX_CAS_RETRIES: u32 = 4;
+
+struct App {
+    /// 运行 ID 单调计数；配合毫秒时间戳避免重启冲突。
+    counter: AtomicU64,
+}
+
+#[tokio::main]
+async fn main() {
+    let session = match gateway_plugin_sdk::client::PluginSession::accept(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        SessionConfig::default(),
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(_) => return,
+    };
+    let app = Arc::new(App {
+        counter: AtomicU64::new(0),
+    });
+    let plugin = match PluginBuilder::from_json(include_bytes!("../plugin.json"))
+        .and_then(|builder| builder.management(registration(), management(app.clone())))
+        .and_then(|builder| builder.build())
+    {
+        Ok(plugin) => plugin,
+        Err(_) => return,
+    };
+    let _ = session.run(plugin).await;
+}
+
+type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+type ManagementCall = TypedCall<gateway_plugin_sdk::call::management::ManagementRequest>;
+type ManagementResponse = gateway_plugin_sdk::call::management::ManagementResponse;
+type ManagementResult = Result<TypedReply<ManagementResponse>, PluginFault>;
+
+fn management(app: Arc<App>) -> impl Fn(ManagementCall) -> BoxFuture<ManagementResult> {
+    move |call: ManagementCall| {
+        let app = Arc::clone(&app);
+        Box::pin(async move { handle(&app, call).await })
+    }
+}
+
+async fn handle(app: &App, call: ManagementCall) -> ManagementResult {
+    let request = &call.request;
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "bootstrap") => bootstrap(&call.host).await,
+        ("GET", "models") => models(&call, &request.query).await,
+        ("GET", "settings") => settings::load(&call.host).await,
+        ("POST", "settings") => settings::save(&call).await,
+        ("POST", "settings-reset") => settings::reset(&call.host).await,
+        ("POST", "runs") => create_run(app, &call).await,
+        ("GET", "runs") => list_runs(&call.host).await,
+        ("POST", "run/step") => step_run(&call).await,
+        ("POST", "run/cancel") => cancel_run(&call).await,
+        ("GET", "run") => get_run(&call, &request.query).await,
+        ("POST", "run/report") => report_run(&call).await,
+        ("POST", "run/delete") => delete_run(&call).await,
+        _ => json_response(404, json!({"error": "unknown management route"})),
+    }
+}
+
+fn json_response(status: u16, body: serde_json::Value) -> ManagementResult {
+    Ok(TypedReply::new(ManagementResponse {
+        status,
+        content_type: "application/json".to_owned(),
+    })
+    .with_payload(serde_json::to_vec(&body).unwrap_or_default()))
+}
+
+fn decode_body<T: serde::de::DeserializeOwned>(call: &ManagementCall) -> Result<T, PluginFault> {
+    serde_json::from_slice(&call.payload)
+        .map_err(|_| PluginFault::new(ErrorCode::InvalidInput, "request body is malformed"))
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if parts.next() == Some(key) {
+            return Some(percent_decode(parts.next().unwrap_or_default()));
+        }
+    }
+    None
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                if let Ok(value) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                    output.push(value);
+                } else {
+                    output.push(b'%');
+                }
+                index += 3;
+            }
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn code_name(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::PermissionDenied => "permission_denied",
+        ErrorCode::InvalidInput => "invalid_input",
+        ErrorCode::Timeout => "timeout",
+        ErrorCode::Cancelled => "cancelled",
+        ErrorCode::Capacity => "capacity",
+        ErrorCode::Upstream => "upstream",
+        ErrorCode::Rejected => "rejected",
+        ErrorCode::Unsupported => "unsupported",
+        ErrorCode::Conflict => "conflict",
+        _ => "fault",
+    }
+}
+
+fn fault_message(fault: &PluginFault) -> String {
+    format!("{}: {}", code_name(fault.code), fault.message)
+}
+
+async fn bootstrap(host: &HostClient) -> ManagementResult {
+    let keys = match model::list_keys(host).await {
+        Ok(keys) => keys,
+        Err(error) => return json_response(502, json!({"error": fault_message(&error)})),
+    };
+    let accounts = match model::list_accounts(host).await {
+        Ok(accounts) => accounts,
+        Err(error) => return json_response(502, json!({"error": fault_message(&error)})),
+    };
+    json_response(
+        200,
+        json!({
+            "keys": keys.iter().map(|key| json!({
+                "id": key.id, "name": key.name, "enabled": key.enabled,
+            })).collect::<Vec<_>>(),
+            "accounts": accounts.iter().map(|account| json!({
+                "account_id": account.account_id,
+                "provider_id": account.provider_id,
+                "name": account.name,
+                "enabled": account.enabled,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+async fn models(call: &ManagementCall, query: &str) -> ManagementResult {
+    let Some(key_id) = query_param(query, "key").filter(|key| !key.is_empty()) else {
+        return json_response(400, json!({"error": "missing key"}));
+    };
+    match model::list_models(&call.host, &key_id).await {
+        Ok(models) => json_response(200, json!({"models": models})),
+        Err(error) => json_response(502, json!({"error": fault_message(&error)})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    model: String,
+    client_key_id: String,
+    #[serde(default)]
+    client_key_name: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    account_name: Option<String>,
+    queries: Vec<CreateQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateQuery {
+    prompt: String,
+    expected_count: u32,
+}
+
+fn next_run_id(app: &App) -> String {
+    let counter = app.counter.fetch_add(1, Ordering::Relaxed);
+    let time = runs::now_ms();
+    format!("{time:x}-{counter:04x}")
+}
+
+/// 运行进入终态或需要归因时同步索引，历史列表才能反映真实状态与结果。
+async fn sync_index(host: &HostClient, run: &runs::RunState) {
+    runs::touch_index(host, run.index_entry()).await;
+}
+
+async fn create_run(app: &App, call: &ManagementCall) -> ManagementResult {
+    let request: CreateRequest = match decode_body(call) {
+        Ok(request) => request,
+        Err(error) => return json_response(400, json!({"error": error.message})),
+    };
+    if request.model.is_empty() || request.model.len() > 128 {
+        return json_response(400, json!({"error": "model is required"}));
+    }
+    if request.client_key_id.is_empty() || request.client_key_id.len() > 128 {
+        return json_response(400, json!({"error": "client_key_id is required"}));
+    }
+    if request.queries.is_empty() || request.queries.len() > MAX_QUERIES {
+        return json_response(
+            400,
+            json!({"error": "queries must contain 1..=3 challenges"}),
+        );
+    }
+    let mut seen_counts = BTreeSet::new();
+    for query in &request.queries {
+        if !(MIN_EXPECTED_COUNT..=MAX_EXPECTED_COUNT).contains(&query.expected_count) {
+            return json_response(400, json!({"error": "expected_count out of range"}));
+        }
+        seen_counts.insert(query.expected_count);
+        if query.prompt.is_empty() || query.prompt.len() > MAX_PROMPT_BYTES {
+            return json_response(
+                400,
+                json!({"error": "challenge prompt is empty or too large"}),
+            );
+        }
+    }
+    // 与 ModelTrace 一致：多道挑战要求不同长度，避免同分布重复。
+    if request.queries.len() > 1 && seen_counts.len() != request.queries.len() {
+        return json_response(400, json!({"error": "challenge counts must be distinct"}));
+    }
+    let now = runs::now_ms();
+    let run = RunState {
+        id: next_run_id(app),
+        status: "pending".to_owned(),
+        model: request.model,
+        client_key_id: request.client_key_id,
+        client_key_name: request.client_key_name.filter(|name| !name.is_empty()),
+        account_id: request.account_id.filter(|id| !id.is_empty()),
+        provider: request.provider.filter(|id| !id.is_empty()),
+        account_name: request.account_name.filter(|name| !name.is_empty()),
+        created_at_ms: now,
+        updated_at_ms: now,
+        completed_at_ms: None,
+        cancel_requested: false,
+        queries: request
+            .queries
+            .into_iter()
+            .enumerate()
+            .map(|(index, query)| QueryState {
+                index: index as u32,
+                prompt: query.prompt,
+                expected_count: query.expected_count,
+                status: "pending".to_owned(),
+                attempts: Vec::new(),
+                numbers: None,
+                response: None,
+            })
+            .collect(),
+        result: None,
+    };
+    let run_id = run.id.clone();
+    match runs::save_run(&call.host, &run, None).await {
+        Ok(_) => {
+            runs::touch_index(
+                &call.host,
+                RunIndexEntry {
+                    id: run_id.clone(),
+                    model: run.model.clone(),
+                    client_key_name: run.client_key_name.clone(),
+                    account_id: run.account_id.clone(),
+                    account_name: run.account_name.clone(),
+                    status: run.status.clone(),
+                    created_at_ms: now,
+                    prediction: None,
+                    probability: None,
+                },
+            )
+            .await;
+            json_response(200, json!({"id": run_id, "run": run.view()}))
+        }
+        Err(error) => json_response(500, json!({"error": fault_message(&error)})),
+    }
+}
+
+async fn list_runs(host: &HostClient) -> ManagementResult {
+    json_response(200, json!({"runs": runs::load_index(host).await}))
+}
+
+async fn get_run(call: &ManagementCall, query: &str) -> ManagementResult {
+    let Some(id) = query_param(query, "id").filter(|id| !id.is_empty()) else {
+        return json_response(400, json!({"error": "missing id"}));
+    };
+    match runs::load_run(&call.host, &id).await {
+        Ok(Some((run, _))) => json_response(200, json!({"run": run.view()})),
+        _ => json_response(404, json!({"error": "run not found"})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RunRef {
+    id: String,
+    /// `report`：页面本地归因结果摘要。
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+}
+
+/// 执行下一道待处理挑战：先 CAS 标记 running，调用模型，再 CAS 落盘尝试结果。
+/// 模型响应先在页面本地解析为数字序列随本请求带回；解析失败按无效回答计入尝试。
+async fn step_run(call: &ManagementCall) -> ManagementResult {
+    let request: RunRef = match decode_body(call) {
+        Ok(request) => request,
+        Err(error) => return json_response(400, json!({"error": error.message})),
+    };
+    for _ in 0..MAX_CAS_RETRIES {
+        let Some((mut run, version)) = (match runs::load_run(&call.host, &request.id).await {
+            Ok(found) => found,
+            Err(error) => return json_response(500, json!({"error": fault_message(&error)})),
+        }) else {
+            return json_response(404, json!({"error": "run not found"}));
+        };
+        if matches!(run.status.as_str(), "completed" | "cancelled" | "failed") {
+            sync_index(&call.host, &run).await;
+            return json_response(
+                409,
+                json!({"error": "run already finished", "run": run.view()}),
+            );
+        }
+        if run.cancel_requested {
+            run.status = "cancelled".to_owned();
+            run.completed_at_ms = Some(runs::now_ms());
+            run.updated_at_ms = runs::now_ms();
+            let _ = runs::save_run(&call.host, &run, Some(version)).await;
+            sync_index(&call.host, &run).await;
+            return json_response(200, json!({"run": run.view()}));
+        }
+        // 找到下一道未接受的挑战；全部接受表示可进入本地归因。
+        let pending_index = run
+            .queries
+            .iter()
+            .position(|query| query.status != "accepted");
+        let Some(position) = pending_index else {
+            run.status = "collecting".to_owned();
+            run.updated_at_ms = runs::now_ms();
+            let _ = runs::save_run(&call.host, &run, Some(version)).await;
+            sync_index(&call.host, &run).await;
+            return json_response(200, json!({"run": run.view()}));
+        };
+        let attempts = run.queries[position].attempts.len() as u32;
+        if attempts >= runs::MAX_ATTEMPTS {
+            run.status = "failed".to_owned();
+            run.completed_at_ms = Some(runs::now_ms());
+            run.updated_at_ms = runs::now_ms();
+            let _ = runs::save_run(&call.host, &run, Some(version)).await;
+            sync_index(&call.host, &run).await;
+            return json_response(
+                200,
+                json!({"run": run.view(), "error": "maximum attempts exceeded"}),
+            );
+        }
+        let prompt = run.queries[position].prompt.clone();
+        run.queries[position].status = "running".to_owned();
+        run.status = "running".to_owned();
+        run.updated_at_ms = runs::now_ms();
+        if let Err(error) = runs::save_run(&call.host, &run, Some(version)).await {
+            if error.code == ErrorCode::Conflict {
+                continue;
+            }
+            return json_response(500, json!({"error": fault_message(&error)}));
+        }
+
+        // 真正发起一次模型调用：页面提交的 challenge prompt 原样转发。
+        let outcome = model::generate(
+            &call.host,
+            &run.client_key_id,
+            &run.model,
+            run.provider.as_deref(),
+            run.account_id.as_deref(),
+            &prompt,
+        )
+        .await;
+
+        // 原始输出只返回给本次步骤调用方（即发起测试的页面），用于本地解析；
+        // 持久化视图只保留数字序列与短预览。
+        let outcome_text = outcome.as_ref().map(|outcome| outcome.text.clone()).ok();
+
+        // 重新读取并追加尝试记录；期间若被请求取消，仍记录本次真实结果再收敛状态。
+        let Some((mut current, version)) = (match runs::load_run(&call.host, &request.id).await {
+            Ok(found) => found,
+            Err(error) => return json_response(500, json!({"error": fault_message(&error)})),
+        }) else {
+            return json_response(500, json!({"error": "run state disappeared"}));
+        };
+        let Some(query) = current.queries.get_mut(position) else {
+            return json_response(500, json!({"error": "query state missing"}));
+        };
+        let attempt_index = query.attempts.len() as u32 + 1;
+        match outcome {
+            Ok(outcome) => {
+                let numbers = parse::parse_numbers(&outcome.text);
+                let minimum = (f64::from(query.expected_count) * 0.55).ceil() as usize;
+                let minimum = minimum.max(80);
+                let accepted = numbers.len() >= minimum;
+                query.attempts.push(AttemptRecord {
+                    index: attempt_index,
+                    status: if accepted { "accepted" } else { "rejected" }.to_owned(),
+                    parsed_numbers: Some(numbers.len()),
+                    minimum_numbers: Some(minimum),
+                    finish_reason: outcome.finish_reason.clone(),
+                    upstream_model: outcome.model.clone(),
+                    input_tokens: outcome.input_tokens,
+                    output_tokens: outcome.output_tokens,
+                    error: None,
+                    text_preview: Some(
+                        outcome
+                            .text
+                            .chars()
+                            .take(TEXT_PREVIEW_CHARS)
+                            .collect::<String>(),
+                    ),
+                });
+                if accepted {
+                    query.status = "accepted".to_owned();
+                    query.numbers = Some(numbers);
+                    let mut response = outcome;
+                    response.text.truncate(RESPONSE_TEXT_BYTES);
+                    query.response = Some(response);
+                } else {
+                    query.status = "pending".to_owned();
+                }
+            }
+            Err(error) => {
+                query.attempts.push(AttemptRecord {
+                    index: attempt_index,
+                    status: "failed".to_owned(),
+                    parsed_numbers: None,
+                    minimum_numbers: None,
+                    finish_reason: None,
+                    upstream_model: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    error: Some(fault_message(&error)),
+                    text_preview: None,
+                });
+                query.status = "pending".to_owned();
+            }
+        }
+        if current.cancel_requested {
+            current.status = "cancelled".to_owned();
+            current.completed_at_ms = Some(runs::now_ms());
+        } else if current
+            .queries
+            .iter()
+            .all(|query| query.status == "accepted")
+        {
+            current.status = "collecting".to_owned();
+        }
+        current.updated_at_ms = runs::now_ms();
+        match runs::save_run(&call.host, &current, Some(version)).await {
+            Ok(_) => {
+                sync_index(&call.host, &current).await;
+                return json_response(
+                    200,
+                    json!({"run": current.view(), "response_text": outcome_text}),
+                );
+            }
+            Err(error) if error.code == ErrorCode::Conflict => continue,
+            Err(error) => return json_response(500, json!({"error": fault_message(&error)})),
+        }
+    }
+    json_response(409, json!({"error": "run is busy, retry"}))
+}
+
+async fn cancel_run(call: &ManagementCall) -> ManagementResult {
+    let request: RunRef = match decode_body(call) {
+        Ok(request) => request,
+        Err(error) => return json_response(400, json!({"error": error.message})),
+    };
+    let Some((mut run, version)) = (match runs::load_run(&call.host, &request.id).await {
+        Ok(found) => found,
+        Err(error) => return json_response(500, json!({"error": fault_message(&error)})),
+    }) else {
+        return json_response(404, json!({"error": "run not found"}));
+    };
+    if matches!(run.status.as_str(), "completed" | "cancelled" | "failed") {
+        return json_response(200, json!({"run": run.view()}));
+    }
+    run.cancel_requested = true;
+    run.updated_at_ms = runs::now_ms();
+    // 正在执行的模型调用不可中断由宿主决定；这里先记录取消意图。
+    let _ = runs::save_run(&call.host, &run, Some(version)).await;
+    sync_index(&call.host, &run).await;
+    json_response(200, json!({"run": run.view()}))
+}
+
+async fn report_run(call: &ManagementCall) -> ManagementResult {
+    let request: RunRef = match decode_body(call) {
+        Ok(request) => request,
+        Err(error) => return json_response(400, json!({"error": error.message})),
+    };
+    let Some(result) = request.result else {
+        return json_response(400, json!({"error": "missing result"}));
+    };
+    let Some((mut run, version)) = (match runs::load_run(&call.host, &request.id).await {
+        Ok(found) => found,
+        Err(error) => return json_response(500, json!({"error": fault_message(&error)})),
+    }) else {
+        return json_response(404, json!({"error": "run not found"}));
+    };
+    run.result = Some(result);
+    run.status = "completed".to_owned();
+    run.completed_at_ms = Some(runs::now_ms());
+    run.updated_at_ms = runs::now_ms();
+    if let Err(error) = runs::save_run(&call.host, &run, Some(version)).await {
+        return json_response(500, json!({"error": fault_message(&error)}));
+    }
+    runs::touch_index(&call.host, run.index_entry()).await;
+    json_response(200, json!({"run": run.view()}))
+}
+
+async fn delete_run(call: &ManagementCall) -> ManagementResult {
+    let request: RunRef = match decode_body(call) {
+        Ok(request) => request,
+        Err(error) => return json_response(400, json!({"error": error.message})),
+    };
+    let Some((_run, version)) = (match runs::load_run(&call.host, &request.id).await {
+        Ok(found) => found,
+        Err(error) => return json_response(500, json!({"error": fault_message(&error)})),
+    }) else {
+        return json_response(404, json!({"error": "run not found"}));
+    };
+    let params = match serde_json::to_value(StateDeleteRequest {
+        namespace: runs::NAMESPACE.to_owned(),
+        key: format!("run-{}", request.id),
+        expected_version: version,
+    }) {
+        Ok(params) => params,
+        Err(_) => {
+            return json_response(500, json!({"error": "state payload encode failed"}));
+        }
+    };
+    match call
+        .host
+        .call("host.state.delete", params, Vec::new())
+        .await
+    {
+        Ok(reply) => {
+            let _ = serde_json::from_value::<StateDeleteResult>(reply.result);
+            let mut entries = runs::load_index(&call.host).await;
+            entries.retain(|item| item.id != request.id);
+            if let Err(error) = runs::save_index_entries(&call.host, &entries).await {
+                return json_response(500, json!({"error": fault_message(&error)}));
+            }
+            json_response(200, json!({"ok": true}))
+        }
+        Err(error) => json_response(500, json!({"error": error.into_plugin_fault().message})),
+    }
+}
+
+fn registration() -> ManagementRegistration {
+    fn route(method: &str, path: &str, request_types: &[&str]) -> ManagementRoute {
+        ManagementRoute {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            request_content_types: request_types.iter().map(|item| item.to_string()).collect(),
+            response_content_types: vec!["application/json".to_owned()],
+        }
+    }
+    ManagementRegistration {
+        routes: vec![
+            route("GET", "bootstrap", &[]),
+            route("GET", "models", &[]),
+            route("GET", "settings", &[]),
+            route("POST", "settings", &["application/json"]),
+            route("POST", "settings-reset", &["application/json"]),
+            route("POST", "runs", &["application/json"]),
+            route("GET", "runs", &[]),
+            route("POST", "run/step", &["application/json"]),
+            route("POST", "run/cancel", &["application/json"]),
+            route("GET", "run", &[]),
+            route("POST", "run/report", &["application/json"]),
+            route("POST", "run/delete", &["application/json"]),
+        ],
+        resources: vec![
+            ManagementResource {
+                path: "ui/index.html".to_owned(),
+                public: false,
+            },
+            ManagementResource {
+                path: "ui/app.js".to_owned(),
+                public: false,
+            },
+            ManagementResource {
+                path: "ui/trace.js".to_owned(),
+                public: false,
+            },
+            ManagementResource {
+                path: "ui/style.css".to_owned(),
+                public: false,
+            },
+            ManagementResource {
+                path: "ui/icon.svg".to_owned(),
+                public: false,
+            },
+            ManagementResource {
+                path: "ui/data/unified_bank.js".to_owned(),
+                public: false,
+            },
+        ],
+        pages: vec![ManagementPage {
+            id: "model-trace".to_owned(),
+            title: "模型指纹检测".to_owned(),
+            description: Some(
+                "选择账号与模型，发送三条长整数挑战并按 ModelTrace 指纹库归因".to_owned(),
+            ),
+            entry: "ui/index.html".to_owned(),
+            icon: Some("ui/icon.svg".to_owned()),
+        }],
+        callbacks: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_plugin_sdk::{Capability, Manifest, Permission};
+
+    #[test]
+    fn manifest_parses_and_declares_management() {
+        let manifest = Manifest::from_author_slice(include_bytes!("../plugin.json")).unwrap();
+        assert_eq!(manifest.manifest_version, 1);
+        assert!(manifest.permissions.contains(&Permission::Models));
+        assert!(manifest.permissions.contains(&Permission::Accounts));
+        assert!(manifest.contributes.contains_key(&Capability::Management));
+    }
+}

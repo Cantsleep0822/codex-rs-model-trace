@@ -1,0 +1,40 @@
+{
+  "manifestVersion": 1,
+  "name": "model-trace",
+  "displayName": "模型指纹检测",
+  "publisher": "xunzhimeng",
+  "version": "0.1.0",
+  "description": "基于 ModelTrace 数字指纹方法：向指定账号与模型发送三条长整数挑战，比对指纹库推测实际模型家族与版本。",
+  "license": "MIT",
+  "author": "xunzhimeng",
+  "engines": {
+    "codex-proxy-rs": ">=3.15.0, <4.0.0"
+  },
+  "main": "bin/model-trace",
+  "runtime": "trustedProcess",
+  "contributes": {
+    "management": {}
+  },
+  "permissions": ["models", "accounts"],
+  "resources": {
+    "ui/index.html": "text/html",
+    "ui/app.js": "text/javascript",
+    "ui/trace.js": "text/javascript",
+    "ui/data/unified_bank.js": "text/javascript",
+    "ui/style.css": "text/css",
+    "ui/icon.svg": "image/svg+xml"
+  },
+  "icon": "ui/icon.svg",
+  "state": [
+    {
+      "namespace": "trace",
+      "schemaVersion": 1,
+      "schema": {
+        "type": "object"
+      },
+      "maximumRecords": 64,
+      "maximumBytes": 8388608,
+      "maximumValueBytes": 262144
+    }
+  ]
+}

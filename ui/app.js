@@ -1,0 +1,684 @@
+/*
+ * 模型指纹检测页面逻辑：选择 Key / 账号 / 模型 → 生成三条挑战 →
+ * 逐条经管理路由调用模型 → 本地指纹归因并回写结果。
+ */
+(function () {
+  'use strict';
+
+  var bridge = window.codexProxyPlugin;
+  var bank = window.MODEL_TRACE_BANK;
+  var trace = window.ModelTrace;
+
+  // —— 页面状态 ——
+  var state = {
+    keys: [],
+    accounts: [],
+    models: [],
+    challenges: null,
+    run: null,
+    busy: false,
+    stepInFlight: false,
+    stepSentAt: 0,
+    lastViewedRun: null,
+    settings: { challenge_count: 3, history_limit: 24 },
+  };
+
+  // 桥 invoke 超时是 30s，而管理调用最长约 120s；步骤调用可能先超时再由后端落盘。
+  var STEP_RESEND_MS = 150000;
+  var POLL_MS = 4000;
+
+  function $(id) {
+    return document.getElementById(id);
+  }
+
+  function setText(id, text) {
+    $(id).textContent = text;
+  }
+
+  function show(id, visible) {
+    $(id).hidden = !visible;
+  }
+
+  function toast(message, kind) {
+    var node = $('toast');
+    node.textContent = message;
+    node.className = 'toast ' + (kind || '');
+    node.hidden = false;
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () { node.hidden = true; }, 4000);
+  }
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function decodeJsonBody(result) {
+    var text = new TextDecoder('utf-8').decode(result.body || new ArrayBuffer(0));
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new Error('插件响应不是有效 JSON');
+    }
+  }
+
+  async function call(method, path, query, body) {
+    var input = { method: method, path: path };
+    if (query) input.query = query;
+    if (body !== undefined) {
+      input.contentType = 'application/json';
+      input.body = JSON.stringify(body);
+    }
+    var result = await bridge.request(input);
+    var data = decodeJsonBody(result);
+    if (result.status < 200 || result.status >= 300) {
+      var message = data && data.error ? String(data.error) : ('HTTP ' + result.status);
+      throw new Error(message);
+    }
+    return data;
+  }
+
+  function option(value, label) {
+    var node = document.createElement('option');
+    node.value = value;
+    node.textContent = label;
+    return node;
+  }
+
+  function fillSelect(node, items, placeholder) {
+    node.textContent = '';
+    node.appendChild(option('', placeholder));
+    items.forEach(function (item) {
+      node.appendChild(option(item.value, item.label));
+    });
+  }
+
+  function hint(message, kind) {
+    var node = $('start-hint');
+    node.textContent = message;
+    node.className = 'form-hint ' + (kind || '');
+  }
+
+  // —— 设置 ——
+
+  function applySettings(settings) {
+    if (!settings) return;
+    if (settings.challenge_count) state.settings.challenge_count = settings.challenge_count;
+    if (settings.history_limit) state.settings.history_limit = settings.history_limit;
+    $('f-count').value = String(state.settings.challenge_count);
+    $('f-history').value = String(state.settings.history_limit);
+  }
+
+  function settingsHint(message, kind) {
+    var node = $('settings-hint');
+    node.textContent = message;
+    node.className = 'form-hint ' + (kind || '');
+  }
+
+  async function loadSettings() {
+    try {
+      var data = await call('GET', 'settings');
+      applySettings(data.settings);
+      settingsHint('');
+    } catch (error) {
+      settingsHint('设置加载失败，使用默认值。', 'fail');
+    }
+  }
+
+  async function saveSettings() {
+    try {
+      var data = await call('POST', 'settings', undefined, {
+        challenge_count: Number($('f-count').value),
+        history_limit: Number($('f-history').value),
+      });
+      applySettings(data.settings);
+      settingsHint('已保存，立即生效。', 'ok');
+      loadHistory();
+    } catch (error) {
+      settingsHint('保存失败：' + error.message, 'fail');
+    }
+  }
+
+  async function resetSettings() {
+    try {
+      var data = await call('POST', 'settings-reset', undefined, {});
+      applySettings(data.settings);
+      settingsHint('已恢复默认。', 'ok');
+      loadHistory();
+    } catch (error) {
+      settingsHint('恢复默认失败：' + error.message, 'fail');
+    }
+  }
+
+  function refreshStartButton() {
+    $('start-btn').disabled = state.busy
+      || !$('f-key').value
+      || !$('f-model').value
+      || !bank;
+  }
+
+  // —— 初始化与表单 ——
+
+  async function bootstrap() {
+    if (!bridge) {
+      hint('未检测到宿主页面桥，请在管理端插件页面中打开。', 'fail');
+      return;
+    }
+    if (!bank || !bank.models || !bank.models.length) {
+      hint('指纹库未加载，无法开始检测。', 'fail');
+    }
+    var data = await call('GET', 'bootstrap');
+    state.keys = (data.keys || []).filter(function (key) { return key.enabled; });
+    state.accounts = data.accounts || [];
+    fillSelect(
+      $('f-key'),
+      state.keys.map(function (key) {
+        return { value: key.id, label: key.name ? key.name + '（' + key.id + '）' : key.id };
+      }),
+      '选择 Key'
+    );
+    fillSelect(
+      $('f-account'),
+      [{ value: '', label: '自动调度（按 Key 正常调度）' }].concat(
+        state.accounts.map(function (account) {
+          var label = (account.name || account.account_id)
+            + '（' + account.provider_id + (account.enabled ? '' : '，已停用') + '）';
+          return { value: account.account_id, label: label };
+        })
+      ),
+      '自动调度（按 Key 正常调度）'
+    );
+    // 自动调度选项以空值提交；option('', ...) 已经占位，这里去掉重复项。
+    $('f-account').value = '';
+    await loadModels();
+    hint('共 ' + state.accounts.length + ' 个上游账号；不指定账号时按网关正常调度。', '');
+  }
+
+  async function loadModels() {
+    var keyId = $('f-key').value;
+    state.models = [];
+    fillSelect($('f-model'), [], keyId ? '加载中…' : '先选择 Key');
+    if (!keyId) return;
+    try {
+      var data = await call('GET', 'models', 'key=' + encodeURIComponent(keyId));
+      state.models = data.models || [];
+      fillSelect(
+        $('f-model'),
+        state.models.map(function (model) { return { value: model, label: model }; }),
+        '选择模型'
+      );
+      hint(state.models.length ? '模型目录已加载，共 ' + state.models.length + ' 个。' : '该 Key 当前没有可见模型。', state.models.length ? 'ok' : 'fail');
+    } catch (error) {
+      fillSelect($('f-model'), [], '选择模型');
+      hint('模型目录加载失败：' + error.message, 'fail');
+    }
+    refreshStartButton();
+  }
+
+  function selectedAccount() {
+    var id = $('f-account').value;
+    if (!id) return null;
+    return state.accounts.find(function (account) { return account.account_id === id; }) || null;
+  }
+
+  // —— 运行驱动 ——
+
+  async function startRun() {
+    if (state.busy) return;
+    var keyId = $('f-key').value;
+    var model = $('f-model').value;
+    if (!keyId || !model) return;
+    var account = selectedAccount();
+    state.busy = true;
+    refreshStartButton();
+    try {
+      state.challenges = trace.generateChallenges(state.settings.challenge_count);
+      var keyName = '';
+      state.keys.forEach(function (key) { if (key.id === keyId) keyName = key.name || ''; });
+      var created = await call('POST', 'runs', undefined, {
+        model: model,
+        client_key_id: keyId,
+        client_key_name: keyName || null,
+        account_id: account ? account.account_id : null,
+        provider: account ? account.provider_id : null,
+        account_name: account ? (account.name || null) : null,
+        queries: state.challenges.map(function (challenge) {
+          return { prompt: challenge.prompt, expected_count: challenge.expected_count };
+        }),
+      });
+      state.run = created.run;
+      state.lastViewedRun = created.run;
+      show('result-card', false);
+      toast('已创建检测任务，开始逐题调用模型。', 'ok');
+      void drive();
+    } catch (error) {
+      toast('创建检测失败：' + error.message, 'fail');
+      state.busy = false;
+      refreshStartButton();
+    }
+  }
+
+  // 每轮只推进一道挑战；步骤调用超时后靠轮询恢复状态，超时才重发。
+  async function drive() {
+    while (state.run && state.busy) {
+      var run = state.run;
+      if (['completed', 'cancelled', 'failed'].indexOf(run.status) >= 0) {
+        renderRun(run);
+        await afterRunFinished(run);
+        return;
+      }
+      var allAccepted = run.queries.every(function (query) { return query.status === 'accepted'; });
+      if (allAccepted && run.status === 'collecting') {
+        await finishAttribution(run);
+        return;
+      }
+      var running = run.queries.some(function (query) { return query.status === 'running'; });
+      var shouldStep = !state.stepInFlight
+        && (!running || Date.now() - state.stepSentAt > STEP_RESEND_MS);
+      if (shouldStep) {
+        state.stepInFlight = true;
+        state.stepSentAt = Date.now();
+        call('POST', 'run/step', undefined, { id: run.id }).then(function (data) {
+          if (data && data.run) {
+            state.run = data.run;
+            state.lastViewedRun = data.run;
+            renderRun(data.run, data.response_text);
+          }
+        }).catch(function () {
+          // 步骤可能仍在后端执行（桥 30s 超时早于管理调用 120s 上限），交给轮询恢复。
+        }).finally(function () {
+          state.stepInFlight = false;
+        });
+      }
+      await sleep(POLL_MS);
+      try {
+        var latest = await call('GET', 'run', 'id=' + encodeURIComponent(state.run.id));
+        if (latest && latest.run) {
+          state.run = latest.run;
+          state.lastViewedRun = latest.run;
+          renderRun(latest.run);
+        }
+      } catch (error) {
+        toast('状态刷新失败：' + error.message, 'fail');
+      }
+    }
+  }
+
+  async function finishAttribution(run) {
+    try {
+      var outputs = run.queries.map(function (query) {
+        return { expected_count: query.expected_count, numbers: query.numbers || [] };
+      });
+      var result = trace.analyzeGlobalOutputs(outputs, bank);
+      var reported = await call('POST', 'run/report', undefined, { id: run.id, result: result });
+      state.run = reported.run || run;
+      state.lastViewedRun = state.run;
+      renderResult(result);
+      renderRun(state.run);
+      toast('归因完成：' + result.prediction_name + '（' + formatPercent(result.probability) + '）', 'ok');
+    } catch (error) {
+      try {
+        var latest = await call('GET', 'run', 'id=' + encodeURIComponent(run.id));
+        state.run = latest.run || run;
+      } catch (_) { /* 保持原状态 */ }
+      state.run.status = 'failed';
+      renderRun(state.run);
+      toast('归因失败：' + error.message, 'fail');
+    } finally {
+      state.busy = false;
+      refreshStartButton();
+      loadHistory();
+    }
+  }
+
+  async function afterRunFinished(run) {
+    state.busy = false;
+    refreshStartButton();
+    if (run.result) {
+      renderResult(run.result);
+    }
+    loadHistory();
+  }
+
+  async function cancelRun() {
+    if (!state.run) return;
+    try {
+      var data = await call('POST', 'run/cancel', undefined, { id: state.run.id });
+      state.run = data.run || state.run;
+      renderRun(state.run);
+      toast('已请求取消，正在进行的模型调用由宿主决定是否中断。', '');
+    } catch (error) {
+      toast('取消失败：' + error.message, 'fail');
+    }
+  }
+
+  async function showDetail(id) {
+    try {
+      var data = await call('GET', 'run', 'id=' + encodeURIComponent(id));
+      if (!data.run) throw new Error('运行不存在');
+      renderRunDetail(data.run);
+      if (data.run.result) {
+        state.lastViewedRun = data.run;
+        renderResult(data.run.result);
+      }
+    } catch (error) {
+      toast('打开详情失败：' + error.message, 'fail');
+    }
+  }
+
+  function attemptCell(attempt) {
+    if (attempt.error) return attempt.error;
+    var parts = ['解析 ' + (attempt.parsed_numbers != null ? attempt.parsed_numbers : 0)
+      + '/' + (attempt.minimum_numbers || '—') + ' 个'];
+    if (attempt.upstream_model) parts.push('上游 ' + attempt.upstream_model);
+    if (attempt.finish_reason) parts.push('finish ' + attempt.finish_reason);
+    var tokens = [];
+    if (attempt.input_tokens != null) tokens.push('入 ' + attempt.input_tokens);
+    if (attempt.output_tokens != null) tokens.push('出 ' + attempt.output_tokens);
+    if (tokens.length) parts.push('token ' + tokens.join('/'));
+    return parts.join(' · ');
+  }
+
+  function renderRunDetail(run) {
+    show('detail-card', true);
+    var account = run.account_name || run.account_id || '自动调度';
+    var prediction = run.result
+      ? (run.result.prediction_name || run.result.prediction || '—')
+        + '（' + formatPercent(run.result.probability) + '）'
+      : '—';
+    setText('detail-sub', '运行 ' + run.id + ' · 创建于 ' + formatTime(run.created_at_ms));
+
+    var meta = $('detail-meta');
+    var fields = [
+      ['执行 Key', run.client_key_name || run.client_key_id || '—'],
+      ['模型', run.model],
+      ['上游账号', account + (run.provider ? '（' + run.provider + '）' : '')],
+      ['状态', run.status],
+      ['归因', prediction],
+      ['更新于', formatTime(run.updated_at_ms)],
+    ];
+    meta.innerHTML = fields.map(function (field) {
+      return '<div><div class="m-label">' + escapeHtml(field[0]) + '</div>'
+        + '<div class="m-value">' + escapeHtml(field[1]) + '</div></div>';
+    }).join('');
+
+    var container = $('detail-queries');
+    container.innerHTML = '';
+    run.queries.forEach(function (query, index) {
+      var block = document.createElement('div');
+      block.className = 'detail-query';
+      var attemptsRows = (query.attempts || []).map(function (attempt) {
+        return '<tr><td class="mono">' + attempt.index + '</td>'
+          + '<td>' + statusTag(attempt.status) + '</td>'
+          + '<td>' + escapeHtml(attemptCell(attempt)) + '</td>'
+          + '<td class="mono">' + escapeHtml(attempt.text_preview || '—') + '</td></tr>';
+      }).join('');
+      if (!attemptsRows) {
+        attemptsRows = '<tr><td colspan="4" class="empty">尚无调用</td></tr>';
+      }
+      var numbers = query.numbers && query.numbers.length
+        ? '<h4 class="block-title">解析数字（' + query.numbers.length + ' 个）</h4>'
+          + '<pre class="numbers-text mono">' + escapeHtml(query.numbers.join(', ')) + '</pre>'
+        : '';
+      block.innerHTML = '<div class="dq-head"><span class="dq-title">挑战 ' + (index + 1) + '</span>'
+        + statusTag(query.status) + '</div>'
+        + '<div class="dq-meta">目标 ' + query.expected_count + ' 个数字 · 尝试 '
+        + (query.attempts || []).length + ' 次</div>'
+        + '<h4 class="block-title">请求 Prompt</h4>'
+        + '<pre class="prompt-text">' + escapeHtml(query.prompt) + '</pre>'
+        + '<div class="table-wrap" style="margin-top:8px"><table class="table compact">'
+        + '<thead><tr><th>次数</th><th>结果</th><th>明细</th><th>回答预览</th></tr></thead>'
+        + '<tbody>' + attemptsRows + '</tbody></table></div>'
+        + numbers;
+      container.appendChild(block);
+    });
+  }
+
+  async function resumeRun(id) {
+    if (state.busy) {
+      toast('当前有检测进行中。', 'fail');
+      return;
+    }
+    try {
+      var data = await call('GET', 'run', 'id=' + encodeURIComponent(id));
+      if (!data.run) throw new Error('运行不存在');
+      var run = data.run;
+      state.run = run;
+      state.lastViewedRun = run;
+      renderRun(run);
+      if (run.result) renderResult(run.result);
+      var finished = ['completed', 'cancelled', 'failed'].includes(run.status);
+      var allAccepted = run.queries.every(function (query) { return query.status === 'accepted'; });
+      if (finished) {
+        return;
+      }
+      if (allAccepted) {
+        // 三道挑战已接受但未回写结果：补做本地归因。
+        state.busy = true;
+        refreshStartButton();
+        await finishAttribution(run);
+        return;
+      }
+      // 接管未完成检测：继续驱动后续步骤。
+      state.busy = true;
+      refreshStartButton();
+      void drive();
+      toast('已接管未完成的检测。', 'ok');
+    } catch (error) {
+      toast('打开运行失败：' + error.message, 'fail');
+    }
+  }
+
+  // —— 渲染 ——
+
+  function statusTag(status) {
+    var map = {
+      pending: ['待执行', ''],
+      running: ['调用中', 'run'],
+      accepted: ['已接受', 'ok'],
+      collecting: ['待归因', 'run'],
+      completed: ['已完成', 'ok'],
+      cancelled: ['已取消', 'warn'],
+      failed: ['失败', 'bad'],
+      rejected: ['未通过', 'warn'],
+    };
+    var entry = map[status] || [status, ''];
+    return '<span class="tag ' + entry[1] + '">' + escapeHtml(entry[0]) + '</span>';
+  }
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (char) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char];
+    });
+  }
+
+  function formatTime(ms) {
+    if (!ms) return '—';
+    var date = new Date(Number(ms));
+    var pad = function (value) { return String(value).padStart(2, '0'); };
+    return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
+      + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
+  }
+
+  function formatPercent(value) {
+    if (value === null || value === undefined || isNaN(value)) return '—';
+    return (value * 100).toFixed(1) + '%';
+  }
+
+  function renderRun(run, responseText) {
+    show('run-card', true);
+    setText('run-title', '当前检测：' + run.model);
+    var account = run.account_name || run.account_id || '自动调度';
+    var keyLabel = run.client_key_name || run.client_key_id || '—';
+    setText('run-sub', 'Key：' + keyLabel + ' · 账号：' + account + ' · 创建：' + formatTime(run.created_at_ms)
+      + ' · 状态：' + run.status);
+    $('cancel-btn').disabled = ['completed', 'cancelled', 'failed'].includes(run.status);
+    var container = $('queries');
+    container.textContent = '';
+    run.queries.forEach(function (query, index) {
+      var card = document.createElement('div');
+      card.className = 'query ' + (query.status === 'running' ? 'running' : query.status === 'accepted' ? 'accepted' : '');
+      var attempts = (query.attempts || []).map(function (attempt) {
+        if (attempt.error) {
+          return '第 ' + attempt.index + ' 次：' + attempt.error;
+        }
+        return '第 ' + attempt.index + ' 次：解析 ' + (attempt.parsed_numbers || 0)
+          + '/' + (attempt.minimum_numbers || '—')
+          + (attempt.upstream_model ? ' · 上游 ' + attempt.upstream_model : '');
+      }).join('\n');
+      card.innerHTML = '<div class="q-title"><span>挑战 ' + (index + 1) + '</span>' + statusTag(query.status) + '</div>'
+        + '<div class="q-meta">目标 ' + query.expected_count + ' 个数字'
+        + (query.numbers ? ' · 已解析 ' + query.numbers.length + ' 个' : '') + '</div>'
+        + '<div class="q-attempts' + (attempts && attempts.includes('错误') ? ' q-error' : '') + '">'
+        + escapeHtml(attempts || '等待调用') + '</div>';
+      container.appendChild(card);
+    });
+    var preview = responseText;
+    if (!preview) {
+      var latest = run.queries.map(function (query) {
+        return (query.attempts || []).slice(-1)[0];
+      }).filter(Boolean).slice(-1)[0];
+      preview = latest && latest.text_preview;
+    }
+    show('response-preview', Boolean(preview));
+    if (preview) setText('response-text', preview);
+  }
+
+  function renderResult(result) {
+    show('result-card', true);
+    var summary = $('result-summary');
+    summary.innerHTML = '<span class="verdict">' + escapeHtml(result.prediction_name || result.prediction) + '</span>'
+      + '<span class="sub">概率 ' + formatPercent(result.probability) + '</span>'
+      + '<span class="sub">家族 ' + escapeHtml(result.family_prediction_name || result.family_prediction || '—')
+      + '（' + formatPercent(result.family_probability) + '）</span>'
+      + '<span class="sub">计入 ' + (result.used_outputs || 0) + ' 道挑战'
+      + ' · 校准 β=' + (result.calibration && result.calibration.beta != null ? Number(result.calibration.beta).toFixed(2) : '—')
+      + (result.calibration && result.calibration.cv_accuracy != null
+        ? ' · 交叉验证 ' + formatPercent(result.calibration.cv_accuracy) : '') + '</span>';
+    setText('result-sub', '推测模型与实际供应方的差异越小，预测越可能指向真实上游型号。');
+
+    var families = $('family-body');
+    families.innerHTML = '';
+    (result.family_probabilities || []).forEach(function (family) {
+      var row = document.createElement('div');
+      row.className = 'bar-row';
+      row.innerHTML = '<span class="name">' + escapeHtml(family.display_name || family.family) + '</span>'
+        + '<span class="bar"><i style="width:' + Math.min(100, family.probability * 100).toFixed(1) + '%"></i></span>'
+        + '<span class="value">' + formatPercent(family.probability) + '</span>';
+      families.appendChild(row);
+    });
+
+    var body = $('models-body');
+    body.innerHTML = '';
+    (result.results || []).forEach(function (item) {
+      var row = document.createElement('tr');
+      row.innerHTML = '<td>' + escapeHtml(item.display_name || item.model) + '</td>'
+        + '<td>' + formatPercent(item.probability) + '</td>'
+        + '<td>' + formatPercent(item.conditional_probability) + '</td>'
+        + '<td>' + formatPercent(item.profile_similarity) + '</td>'
+        + '<td>' + (item.score != null ? Number(item.score).toFixed(3) : '—') + '</td>';
+      body.appendChild(row);
+    });
+
+    var diag = $('diagnostics-body');
+    diag.innerHTML = '';
+    (result.diagnostics || []).forEach(function (item) {
+      var row = document.createElement('tr');
+      row.innerHTML = '<td>挑战 ' + (item.index + 1) + '</td>'
+        + '<td>' + escapeHtml(state.lastViewedRun && state.lastViewedRun.queries[item.index]
+          ? state.lastViewedRun.queries[item.index].expected_count : '—') + '</td>'
+        + '<td>' + (item.parsed_numbers != null ? item.parsed_numbers : '—') + '</td>'
+        + '<td>' + (item.minimum_numbers != null ? item.minimum_numbers : '—') + '</td>'
+        + '<td>' + (item.accepted ? '<span class="tag ok">计入</span>' : '<span class="tag warn">未计入</span>') + '</td>';
+      diag.appendChild(row);
+    });
+  }
+
+  async function loadHistory() {
+    try {
+      var data = await call('GET', 'runs');
+      renderHistory(data.runs || []);
+    } catch (error) {
+      toast('历史记录加载失败：' + error.message, 'fail');
+    }
+  }
+
+  function renderHistory(runs) {
+    var body = $('history-body');
+    body.innerHTML = '';
+    var limit = state.settings.history_limit || runs.length;
+    var shown = runs.slice(0, limit);
+    if (!shown.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty">暂无记录</td></tr>';
+      return;
+    }
+    setText('history-sub', '最近 ' + shown.length + ' / ' + runs.length + ' 次检测，点开可查看请求与回答明细。');
+    shown.forEach(function (run) {
+      var row = document.createElement('tr');
+      var account = run.account_name || run.account_id || '自动调度';
+      var prediction = run.prediction
+        ? escapeHtml(run.prediction) + '（' + formatPercent(run.probability) + '）'
+        : '—';
+      var finished = ['completed', 'cancelled', 'failed'].includes(run.status);
+      var actions = '<button class="btn link" data-detail="' + escapeHtml(run.id) + '">查看</button>';
+      if (!finished) {
+        actions += ' · <button class="btn link" data-open="' + escapeHtml(run.id) + '">继续</button>';
+      }
+      actions += ' · <button class="btn link" data-delete="' + escapeHtml(run.id) + '">删除</button>';
+      row.innerHTML = '<td class="mono">' + formatTime(run.created_at_ms) + '</td>'
+        + '<td>' + escapeHtml(run.client_key_name || '—') + '</td>'
+        + '<td>' + escapeHtml(run.model) + '</td>'
+        + '<td>' + escapeHtml(account) + '</td>'
+        + '<td>' + statusTag(run.status) + '</td>'
+        + '<td>' + prediction + '</td>'
+        + '<td>' + actions + '</td>';
+      body.appendChild(row);
+    });
+  }
+
+  async function deleteRun(id) {
+    try {
+      await call('POST', 'run/delete', undefined, { id: id });
+      toast('已删除。', 'ok');
+      loadHistory();
+    } catch (error) {
+      toast('删除失败：' + error.message, 'fail');
+    }
+  }
+
+  // —— 事件 ——
+
+  function bind() {
+    $('bootstrap-btn').addEventListener('click', function () {
+      bootstrap().catch(function (error) { hint('初始化失败：' + error.message, 'fail'); });
+    });
+    $('f-key').addEventListener('change', function () {
+      loadModels().then(refreshStartButton);
+    });
+    $('f-model').addEventListener('change', refreshStartButton);
+    $('f-account').addEventListener('change', refreshStartButton);
+    $('start-btn').addEventListener('click', function () { void startRun(); });
+    $('cancel-btn').addEventListener('click', function () { void cancelRun(); });
+    $('history-refresh').addEventListener('click', function () { void loadHistory(); });
+    $('settings-save').addEventListener('click', function () { void saveSettings(); });
+    $('settings-reset').addEventListener('click', function () { void resetSettings(); });
+    $('detail-close').addEventListener('click', function () { show('detail-card', false); });
+    $('history-body').addEventListener('click', function (event) {
+      var target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      var detail = target.getAttribute('data-detail');
+      var open = target.getAttribute('data-open');
+      var del = target.getAttribute('data-delete');
+      if (detail) void showDetail(detail);
+      else if (open) void resumeRun(open);
+      else if (del) void deleteRun(del);
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    bind();
+    loadSettings();
+    bootstrap().catch(function (error) { hint('初始化失败：' + error.message, 'fail'); });
+    loadHistory();
+  });
+})();

@@ -1,0 +1,17 @@
+[package]
+name = "model-trace"
+version = "0.1.0"
+edition = "2024"
+description = "ModelTrace 模型指纹检测插件：三条长整数挑战归因实际模型"
+license = "MIT"
+publish = false
+
+[dependencies]
+# SDK 尚未独立发布；固定到宿主仓库 commit，保证本仓库可脱离本地并排目录独立构建。
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "1c6b5a8f1045781d31a301382f1182f1a5657ec8", features = ["io"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", default-features = false, features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "1c6b5a8f1045781d31a301382f1182f1a5657ec8" }

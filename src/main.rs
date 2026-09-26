@@ -510,7 +510,13 @@ async fn step_run(call: &ManagementCall) -> ManagementResult {
                 json!({"run": run.view(), "error": "maximum attempts exceeded"}),
             );
         }
-        let prompt = run.queries[position].prompt.clone();
+        let mut prompt = run.queries[position].prompt.clone();
+        if attempts > 0 {
+            // 重试时追加纠偏指令：只输出逗号分隔的整数，避免序号、说明文字或单词拼写。
+            prompt.push_str(
+                "\n\n注意：上一次回答未能通过校验。请只输出整数本身，用英文逗号分隔，不要输出序号、解释说明或单词拼写的数字。",
+            );
+        }
         run.queries[position].status = "running".to_owned();
         run.status = "running".to_owned();
         run.updated_at_ms = runs::now_ms();

@@ -16,6 +16,7 @@
         </div>
         <div class="actions">
           <button class="btn" id="bootstrap-btn" type="button">刷新</button>
+          <button class="btn" id="result-open" type="button" disabled>归因结果</button>
           <button class="btn" id="settings-open" type="button">设置</button>
           <button class="btn primary" id="start-btn" type="button" disabled>开始检测</button>
         </div>
@@ -85,41 +86,44 @@
       </div>
     </section>
 
-    <section class="card" id="result-card" hidden>
-      <header class="card-head">
-        <div>
-          <h2 class="card-title">归因结果</h2>
-          <p class="card-sub" id="result-sub"></p>
-        </div>
-      </header>
-      <div class="result-summary" id="result-summary"></div>
-      <div class="result-grid">
-        <section>
-          <h3 class="block-title">模型家族</h3>
-          <div id="family-body"></div>
-        </section>
-        <section>
-          <h3 class="block-title">具体模型</h3>
-          <div class="table-wrap">
-            <table class="table compact">
-              <thead>
-                <tr><th>模型</th><th>概率</th><th>家族内</th><th>分布相似度</th><th>得分</th></tr>
-              </thead>
-              <tbody id="models-body"></tbody>
-            </table>
+    <div class="modal-mask" id="result-modal" hidden>
+      <section class="card modal-card" id="result-card" role="dialog" aria-modal="true" aria-labelledby="result-title">
+        <header class="card-head">
+          <div>
+            <h2 class="card-title" id="result-title">归因结果</h2>
+            <p class="card-sub" id="result-sub"></p>
           </div>
-        </section>
-      </div>
-      <h3 class="block-title">挑战明细</h3>
-      <div class="table-wrap">
-        <table class="table compact">
-          <thead>
-            <tr><th>挑战</th><th>目标数量</th><th>解析数量</th><th>尝试次数</th><th>判定</th></tr>
-          </thead>
-          <tbody id="diagnostics-body"></tbody>
-        </table>
-      </div>
-    </section>
+          <button class="btn" id="result-close" type="button">关闭</button>
+        </header>
+        <div class="result-summary" id="result-summary"></div>
+        <div class="result-grid">
+          <section>
+            <h3 class="block-title">模型家族</h3>
+            <div id="family-body"></div>
+          </section>
+          <section>
+            <h3 class="block-title">具体模型</h3>
+            <div class="table-wrap">
+              <table class="table compact">
+                <thead>
+                  <tr><th>模型</th><th>概率</th><th>家族内</th><th>分布相似度</th><th>得分</th></tr>
+                </thead>
+                <tbody id="models-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <h3 class="block-title">挑战明细</h3>
+        <div class="table-wrap">
+          <table class="table compact">
+            <thead>
+              <tr><th>挑战</th><th>目标数量</th><th>解析数量</th><th>尝试次数</th><th>判定</th></tr>
+            </thead>
+            <tbody id="diagnostics-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
 
     <div class="modal-mask" id="settings-modal" hidden>
       <section class="card modal-card modal-narrow" role="dialog" aria-modal="true" aria-labelledby="settings-title">

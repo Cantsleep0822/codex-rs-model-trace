@@ -23,6 +23,7 @@
     detailRunId: null,
     detailRun: null,
     detailTab: 'meta',
+    lastResult: null,
     settings: { challenge_count: 3, history_limit: 24, default_effort: null },
     pollTimer: null,
   };
@@ -162,6 +163,7 @@
       || !$('f-key').value
       || !$('f-model').value
       || !bank;
+    $('result-open').disabled = !state.lastResult;
   }
 
   // —— 初始化与表单 ——
@@ -254,7 +256,9 @@
       });
       state.run = created.run;
       state.lastViewedRun = created.run;
-      show('result-card', false);
+      state.lastResult = null;
+      show('result-modal', false);
+      refreshStartButton();
       toast('已创建检测任务，开始逐题调用模型。', 'ok');
       void drive();
     } catch (error) {
@@ -579,7 +583,8 @@
   }
 
   function renderResult(result) {
-    show('result-card', true);
+    state.lastResult = result;
+    $('result-open').disabled = false;
     var summary = $('result-summary');
     summary.innerHTML = '<span class="verdict">' + escapeHtml(result.prediction_name || result.prediction) + '</span>'
       + '<span class="sub">概率 ' + formatPercent(result.probability) + '</span>'
@@ -712,6 +717,11 @@
     $('settings-close').addEventListener('click', function () { show('settings-modal', false); });
     $('settings-modal').addEventListener('click', function (event) {
       if (event.target === $('settings-modal')) show('settings-modal', false);
+    });
+    $('result-open').addEventListener('click', function () { show('result-modal', true); });
+    $('result-close').addEventListener('click', function () { show('result-modal', false); });
+    $('result-modal').addEventListener('click', function (event) {
+      if (event.target === $('result-modal')) show('result-modal', false);
     });
     $('history-body').addEventListener('click', function (event) {
       var target = event.target;

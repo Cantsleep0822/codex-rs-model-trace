@@ -18,6 +18,8 @@ pub const SETTINGS_KEY: &str = "ui-settings";
 pub const MAX_INDEX_ENTRIES: usize = 24;
 /// 每道挑战允许的最大尝试次数；超出即判定本次测试失败。
 pub const MAX_ATTEMPTS: u32 = 4;
+/// 非终态运行超过该时长未更新按中断处理；必须大于宿主管理调用超时上限。
+pub const STALE_RUN_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunIndexEntry {
@@ -28,7 +30,12 @@ pub struct RunIndexEntry {
     pub account_id: Option<String>,
     pub account_name: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub status_note: Option<String>,
     pub created_at_ms: i64,
+    /// 终态收敛依赖它判断中断运行；旧索引条目缺省为 0，视为需要回读正文。
+    #[serde(default)]
+    pub updated_at_ms: i64,
     pub prediction: Option<String>,
     pub probability: Option<f64>,
 }
@@ -77,6 +84,9 @@ pub struct RunState {
     pub updated_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub cancel_requested: bool,
+    /// 终态说明：额度耗尽、尝试耗尽、页面中断等用户可读原因。
+    #[serde(default)]
+    pub status_note: Option<String>,
     pub queries: Vec<QueryState>,
     /// 页面本地归因回写的结果摘要。
     pub result: Option<serde_json::Value>,
@@ -110,7 +120,9 @@ impl RunState {
             account_id: self.account_id.clone(),
             account_name: self.account_name.clone(),
             status: self.status.clone(),
+            status_note: self.status_note.clone(),
             created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
             prediction: self
                 .result
                 .as_ref()

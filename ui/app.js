@@ -400,7 +400,7 @@
       ['模型', run.model],
       ['上游账号', account + (run.provider ? '（' + run.provider + '）' : '')],
       ['推理强度', run.reasoning_effort || '自动'],
-      ['状态', run.status],
+      ['状态', run.status + (run.status_note ? '：' + run.status_note : '')],
       ['归因', prediction],
       ['更新于', formatTime(run.updated_at_ms)],
     ];
@@ -484,6 +484,7 @@
       running: ['调用中', 'run'],
       accepted: ['已接受', 'ok'],
       collecting: ['待归因', 'run'],
+      interrupted: ['已中断', 'warn'],
       completed: ['已完成', 'ok'],
       cancelled: ['已取消', 'warn'],
       failed: ['失败', 'bad'],
@@ -518,7 +519,7 @@
     var account = run.account_name || run.account_id || '自动调度';
     var keyLabel = run.client_key_name || run.client_key_id || '—';
     setText('run-sub', 'Key：' + keyLabel + ' · 账号：' + account + ' · 创建：' + formatTime(run.created_at_ms)
-      + ' · 状态：' + run.status);
+      + ' · 状态：' + run.status + (run.status_note ? '（' + run.status_note + '）' : ''));
     $('cancel-btn').disabled = ['completed', 'cancelled', 'failed'].includes(run.status);
     var container = $('queries');
     container.textContent = '';

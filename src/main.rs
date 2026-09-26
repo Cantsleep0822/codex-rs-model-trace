@@ -236,6 +236,58 @@ async fn sync_index(host: &HostClient, run: &runs::RunState) {
     runs::touch_index(host, run.index_entry()).await;
 }
 
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "cancelled" | "failed")
+}
+
+/// 不可重试的模型调用错误：配额、账号或权限问题继续尝试只会浪费额度。
+fn is_permanent(fault: &PluginFault) -> bool {
+    match fault.code {
+        ErrorCode::PermissionDenied
+        | ErrorCode::Rejected
+        | ErrorCode::InvalidInput
+        | ErrorCode::Unsupported => true,
+        // 上游 402/403/429 都是额度/计费类信号；419/425 等保留给重试路径。
+        _ => matches!(fault.http_status, Some(402 | 403 | 429)),
+    }
+}
+
+/// 终态说明写入运行与索引，让关页面后的真实原因可直接在历史里看到。
+fn finish_run(run: &mut runs::RunState, status: &str, note: Option<String>) {
+    run.status = status.to_owned();
+    run.status_note = note;
+    run.completed_at_ms = Some(runs::now_ms());
+    run.updated_at_ms = runs::now_ms();
+}
+
+/// 页面关闭后没有驱动方：读取时把超时未更新的非终态运行收敛为中断。
+/// `interrupted` 不是终态，历史里的"继续"可以从断点恢复；`collecting`
+/// 依赖页面本地归因，同样保留给继续流程。
+async fn settle_stale(host: &HostClient, run: &mut runs::RunState, version: u64) {
+    let stale = !is_terminal(&run.status)
+        && run.status != "interrupted"
+        && run.status != "collecting"
+        && runs::now_ms().saturating_sub(run.updated_at_ms) > runs::STALE_RUN_MS;
+    if !stale {
+        return;
+    }
+    for query in &mut run.queries {
+        if query.status == "running" {
+            query.status = "pending".to_owned();
+        }
+    }
+    if run.cancel_requested {
+        finish_run(run, "cancelled", Some("检测已取消".to_owned()));
+    } else {
+        run.status = "interrupted".to_owned();
+        run.status_note = Some("检测中断：页面关闭或步骤超时，可继续".to_owned());
+        run.updated_at_ms = runs::now_ms();
+    }
+    if runs::save_run(host, run, Some(version)).await.is_ok() {
+        sync_index(host, run).await;
+    }
+}
+
 async fn create_run(app: &App, call: &ManagementCall) -> ManagementResult {
     let request: CreateRequest = match decode_body(call) {
         Ok(request) => request,
@@ -294,6 +346,7 @@ async fn create_run(app: &App, call: &ManagementCall) -> ManagementResult {
         updated_at_ms: now,
         completed_at_ms: None,
         cancel_requested: false,
+        status_note: None,
         queries: request
             .queries
             .into_iter()
@@ -322,7 +375,9 @@ async fn create_run(app: &App, call: &ManagementCall) -> ManagementResult {
                     account_id: run.account_id.clone(),
                     account_name: run.account_name.clone(),
                     status: run.status.clone(),
+                    status_note: None,
                     created_at_ms: now,
+                    updated_at_ms: now,
                     prediction: None,
                     probability: None,
                 },
@@ -335,6 +390,24 @@ async fn create_run(app: &App, call: &ManagementCall) -> ManagementResult {
 }
 
 async fn list_runs(host: &HostClient) -> ManagementResult {
+    let entries = runs::load_index(host).await;
+    // 索引里陈旧非终态条目直接收敛，页面打开就能看到真实状态。
+    for entry in &entries {
+        if is_terminal(&entry.status)
+            || entry.status == "interrupted"
+            || entry.status == "collecting"
+        {
+            continue;
+        }
+        let stale = entry.updated_at_ms == 0
+            || runs::now_ms().saturating_sub(entry.updated_at_ms) > runs::STALE_RUN_MS;
+        if !stale {
+            continue;
+        }
+        if let Ok(Some((mut run, version))) = runs::load_run(host, &entry.id).await {
+            settle_stale(host, &mut run, version).await;
+        }
+    }
     json_response(200, json!({"runs": runs::load_index(host).await}))
 }
 
@@ -343,7 +416,10 @@ async fn get_run(call: &ManagementCall, query: &str) -> ManagementResult {
         return json_response(400, json!({"error": "missing id"}));
     };
     match runs::load_run(&call.host, &id).await {
-        Ok(Some((run, _))) => json_response(200, json!({"run": run.view()})),
+        Ok(Some((mut run, version))) => {
+            settle_stale(&call.host, &mut run, version).await;
+            json_response(200, json!({"run": run.view()}))
+        }
         _ => json_response(404, json!({"error": "run not found"})),
     }
 }
@@ -370,7 +446,9 @@ async fn step_run(call: &ManagementCall) -> ManagementResult {
         }) else {
             return json_response(404, json!({"error": "run not found"}));
         };
-        if matches!(run.status.as_str(), "completed" | "cancelled" | "failed") {
+        // 页面重开或补发步骤时，先吃掉未处理的取消意图与中断状态。
+        settle_stale(&call.host, &mut run, version).await;
+        if is_terminal(&run.status) {
             sync_index(&call.host, &run).await;
             return json_response(
                 409,
@@ -378,9 +456,21 @@ async fn step_run(call: &ManagementCall) -> ManagementResult {
             );
         }
         if run.cancel_requested {
-            run.status = "cancelled".to_owned();
-            run.completed_at_ms = Some(runs::now_ms());
-            run.updated_at_ms = runs::now_ms();
+            finish_run(&mut run, "cancelled", Some("检测已取消".to_owned()));
+            let _ = runs::save_run(&call.host, &run, Some(version)).await;
+            sync_index(&call.host, &run).await;
+            return json_response(200, json!({"run": run.view()}));
+        }
+        // 最近一次尝试是不可重试错误：直接终止，不把额度耗在无意义重试上。
+        let permanent_note = run
+            .queries
+            .iter()
+            .flat_map(|query| query.attempts.iter())
+            .last()
+            .filter(|attempt| attempt.status == "failed")
+            .and_then(|attempt| attempt.error.clone());
+        if let Some(note) = permanent_note.filter(|note| !note.is_empty()) {
+            finish_run(&mut run, "failed", Some(note));
             let _ = runs::save_run(&call.host, &run, Some(version)).await;
             sync_index(&call.host, &run).await;
             return json_response(200, json!({"run": run.view()}));
@@ -399,9 +489,19 @@ async fn step_run(call: &ManagementCall) -> ManagementResult {
         };
         let attempts = run.queries[position].attempts.len() as u32;
         if attempts >= runs::MAX_ATTEMPTS {
-            run.status = "failed".to_owned();
-            run.completed_at_ms = Some(runs::now_ms());
-            run.updated_at_ms = runs::now_ms();
+            let note = run.queries[position]
+                .attempts
+                .last()
+                .and_then(|attempt| attempt.error.clone());
+            finish_run(
+                &mut run,
+                "failed",
+                Some(format!(
+                    "挑战尝试耗尽（{} 次）：{}",
+                    runs::MAX_ATTEMPTS,
+                    note.unwrap_or_else(|| "回答未达到要求".to_owned())
+                )),
+            );
             let _ = runs::save_run(&call.host, &run, Some(version)).await;
             sync_index(&call.host, &run).await;
             return json_response(
@@ -482,6 +582,7 @@ async fn step_run(call: &ManagementCall) -> ManagementResult {
                 }
             }
             Err(error) => {
+                let permanent = is_permanent(&error);
                 query.attempts.push(AttemptRecord {
                     index: attempt_index,
                     status: "failed".to_owned(),
@@ -494,18 +595,39 @@ async fn step_run(call: &ManagementCall) -> ManagementResult {
                     error: Some(fault_message(&error)),
                     text_preview: None,
                 });
-                query.status = "pending".to_owned();
+                // 永久错误（额度/权限/协议不支持）与尝试耗尽都不再重试。
+                if permanent || attempt_index >= runs::MAX_ATTEMPTS {
+                    query.status = "failed".to_owned();
+                } else {
+                    query.status = "pending".to_owned();
+                }
             }
         }
         if current.cancel_requested {
-            current.status = "cancelled".to_owned();
-            current.completed_at_ms = Some(runs::now_ms());
+            finish_run(&mut current, "cancelled", Some("检测已取消".to_owned()));
+        } else if current.queries.iter().any(|query| query.status == "failed") {
+            let note = current
+                .queries
+                .iter()
+                .filter(|query| query.status == "failed")
+                .flat_map(|query| query.attempts.iter())
+                .last()
+                .and_then(|attempt| attempt.error.clone());
+            finish_run(
+                &mut current,
+                "failed",
+                Some(note.unwrap_or_else(|| "挑战尝试耗尽".to_owned())),
+            );
         } else if current
             .queries
             .iter()
             .all(|query| query.status == "accepted")
         {
             current.status = "collecting".to_owned();
+            current.status_note = None;
+        } else if current.status != "running" {
+            // 从 interrupted 恢复后保持 running；其余状态维持不变。
+            current.status = "running".to_owned();
         }
         current.updated_at_ms = runs::now_ms();
         match runs::save_run(&call.host, &current, Some(version)).await {
@@ -538,8 +660,18 @@ async fn cancel_run(call: &ManagementCall) -> ManagementResult {
         return json_response(200, json!({"run": run.view()}));
     }
     run.cancel_requested = true;
-    run.updated_at_ms = runs::now_ms();
-    // 正在执行的模型调用不可中断由宿主决定；这里先记录取消意图。
+    // 无步骤在飞时直接落终态：页面关着也能得到确定结果。
+    // 有步骤在飞时其落盘路径会读取 cancel_requested 并收敛，不会复活为 running。
+    let in_flight = run.status == "running";
+    finish_run(
+        &mut run,
+        "cancelled",
+        Some(if in_flight {
+            "检测已取消（步骤结果仍会记录）".to_owned()
+        } else {
+            "检测已取消".to_owned()
+        }),
+    );
     let _ = runs::save_run(&call.host, &run, Some(version)).await;
     sync_index(&call.host, &run).await;
     json_response(200, json!({"run": run.view()}))

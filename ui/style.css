@@ -259,6 +259,7 @@ body {
 }
 .modal-card .table td:last-child { white-space: normal; word-break: break-all; max-width: 320px; }
 
+.numbers-text {
   margin: 0;
   padding: 8px 10px;
   border: 1px dashed var(--border);

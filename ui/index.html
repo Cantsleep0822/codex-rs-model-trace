@@ -65,6 +65,26 @@
       </div>
     </section>
 
+    <section class="card" id="history-card">
+      <header class="card-head">
+        <div>
+          <h2 class="card-title">历史记录</h2>
+          <p class="card-sub" id="history-sub">最近的检测运行，点开可查看请求与回答明细。</p>
+        </div>
+        <button class="btn" id="history-refresh" type="button">刷新</button>
+      </header>
+      <div class="table-wrap">
+        <table class="table compact">
+          <thead>
+            <tr><th>时间</th><th>Key</th><th>模型</th><th>账号</th><th>状态</th><th>推测</th><th>操作</th></tr>
+          </thead>
+          <tbody id="history-body">
+            <tr><td colspan="7" class="empty">暂无记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card" id="result-card" hidden>
       <header class="card-head">
         <div>
@@ -97,26 +117,6 @@
             <tr><th>挑战</th><th>目标数量</th><th>解析数量</th><th>尝试次数</th><th>判定</th></tr>
           </thead>
           <tbody id="diagnostics-body"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card" id="history-card">
-      <header class="card-head">
-        <div>
-          <h2 class="card-title">历史记录</h2>
-          <p class="card-sub" id="history-sub">最近的检测运行，点开可查看请求与回答明细。</p>
-        </div>
-        <button class="btn" id="history-refresh" type="button">刷新</button>
-      </header>
-      <div class="table-wrap">
-        <table class="table compact">
-          <thead>
-            <tr><th>时间</th><th>Key</th><th>模型</th><th>账号</th><th>状态</th><th>推测</th><th>操作</th></tr>
-          </thead>
-          <tbody id="history-body">
-            <tr><td colspan="7" class="empty">暂无记录</td></tr>
-          </tbody>
         </table>
       </div>
     </section>

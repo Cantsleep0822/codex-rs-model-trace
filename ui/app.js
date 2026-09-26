@@ -191,7 +191,9 @@
     fillSelect(
       $('f-account'),
       state.accounts.map(function (account) {
-        var label = (account.name || account.account_id)
+        // 优先显示真实身份：邮箱 > 用户名 > 上游用户 ID > 账号 ID。
+        var identity = account.email || account.name || account.upstream_user_id || account.account_id;
+        var label = identity
           + '（' + account.provider_id + (account.enabled ? '' : '，已停用') + '）';
         return { value: account.account_id, label: label };
       }),
@@ -249,7 +251,7 @@
         reasoning_effort: $('f-effort').value || null,
         account_id: account ? account.account_id : null,
         provider: account ? account.provider_id : null,
-        account_name: account ? (account.name || null) : null,
+        account_name: account ? (account.email || account.name || account.upstream_user_id || null) : null,
         queries: state.challenges.map(function (challenge) {
           return { prompt: challenge.prompt, expected_count: challenge.expected_count };
         }),

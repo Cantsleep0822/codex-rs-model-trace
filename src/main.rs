@@ -183,6 +183,8 @@ async fn bootstrap(host: &HostClient) -> ManagementResult {
                 "account_id": account.account_id,
                 "provider_id": account.provider_id,
                 "name": account.name,
+                "email": account.email,
+                "upstream_user_id": account.upstream_user_id,
                 "enabled": account.enabled,
             })).collect::<Vec<_>>(),
         }),

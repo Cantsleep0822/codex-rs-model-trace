@@ -21,6 +21,8 @@ pub struct AccountOption {
     pub account_id: String,
     pub provider_id: String,
     pub name: String,
+    pub email: Option<String>,
+    pub upstream_user_id: Option<String>,
     pub enabled: bool,
 }
 
@@ -82,6 +84,8 @@ pub async fn list_accounts(host: &HostClient) -> Result<Vec<AccountOption>, Plug
                 account_id: account.account_id,
                 provider_id: account.provider_id,
                 name: account.name,
+                email: account.email,
+                upstream_user_id: account.upstream_user_id,
                 enabled: account.enabled,
             });
         }

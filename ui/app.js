@@ -110,7 +110,6 @@
     $('f-count').value = String(state.settings.challenge_count);
     $('f-history').value = String(state.settings.history_limit);
     $('f-def-effort').value = state.settings.default_effort || '';
-    if (!$('f-effort').value) $('f-effort').value = state.settings.default_effort || '';
   }
 
   function settingsHint(message, kind) {
@@ -182,21 +181,19 @@
       }),
       '选择 Key'
     );
+    // Key 默认选第一个可用项，直接带出模型目录。
+    if (state.keys.length) $('f-key').value = state.keys[0].id;
     fillSelect(
       $('f-account'),
-      [{ value: '', label: '自动调度（按 Key 正常调度）' }].concat(
-        state.accounts.map(function (account) {
-          var label = (account.name || account.account_id)
-            + '（' + account.provider_id + (account.enabled ? '' : '，已停用') + '）';
-          return { value: account.account_id, label: label };
-        })
-      ),
-      '自动调度（按 Key 正常调度）'
+      state.accounts.map(function (account) {
+        var label = (account.name || account.account_id)
+          + '（' + account.provider_id + (account.enabled ? '' : '，已停用') + '）';
+        return { value: account.account_id, label: label };
+      }),
+      '自动（按 Key 调度）'
     );
-    // 自动调度选项以空值提交；option('', ...) 已经占位，这里去掉重复项。
-    $('f-account').value = '';
     await loadModels();
-    hint('共 ' + state.accounts.length + ' 个上游账号；不指定账号时按网关正常调度。', '');
+    hint('共 ' + state.accounts.length + ' 个上游账号；默认为自动调度。', '');
   }
 
   async function loadModels() {
@@ -387,7 +384,7 @@
 
   function renderRunDetail(run) {
     show('detail-card', true);
-    var account = run.account_name || run.account_id || '自动调度';
+    var account = run.account_name || run.account_id || '自动';
     var prediction = run.result
       ? (run.result.prediction_name || run.result.prediction || '—')
         + '（' + formatPercent(run.result.probability) + '）'
@@ -516,7 +513,7 @@
   function renderRun(run, responseText) {
     show('run-card', true);
     setText('run-title', '当前检测：' + run.model);
-    var account = run.account_name || run.account_id || '自动调度';
+    var account = run.account_name || run.account_id || '自动';
     var keyLabel = run.client_key_name || run.client_key_id || '—';
     setText('run-sub', 'Key：' + keyLabel + ' · 账号：' + account + ' · 创建：' + formatTime(run.created_at_ms)
       + ' · 状态：' + run.status + (run.status_note ? '（' + run.status_note + '）' : ''));
@@ -623,7 +620,7 @@
     setText('history-sub', '最近 ' + shown.length + ' / ' + runs.length + ' 次检测，点开可查看请求与回答明细。');
     shown.forEach(function (run) {
       var row = document.createElement('tr');
-      var account = run.account_name || run.account_id || '自动调度';
+      var account = run.account_name || run.account_id || '自动';
       var prediction = run.prediction
         ? escapeHtml(run.prediction) + '（' + formatPercent(run.probability) + '）'
         : '—';
@@ -685,7 +682,10 @@
 
   document.addEventListener('DOMContentLoaded', function () {
     bind();
-    loadSettings();
+    // 生效默认 effort：持久化 default_effort 优先，否则 low；保存/恢复默认不再覆盖表单已选项。
+    loadSettings().then(function () {
+      if (!$('f-effort').value) $('f-effort').value = state.settings.default_effort || 'low';
+    });
     bootstrap().catch(function (error) { hint('初始化失败：' + error.message, 'fail'); });
     loadHistory();
   });

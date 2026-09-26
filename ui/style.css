@@ -238,7 +238,27 @@ body {
   overflow: auto;
 }
 
-.numbers-text {
+/* —— 请求详情弹窗 —— */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 24px 16px;
+  background: rgba(15, 23, 42, .4);
+}
+.modal-mask[hidden] { display: none; }
+.modal-card {
+  width: min(880px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  margin: 0;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, .2);
+}
+.modal-card .table td:last-child { white-space: normal; word-break: break-all; max-width: 320px; }
+
   margin: 0;
   padding: 8px 10px;
   border: 1px dashed var(--border);

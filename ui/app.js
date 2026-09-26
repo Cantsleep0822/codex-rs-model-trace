@@ -383,7 +383,7 @@
   }
 
   function renderRunDetail(run) {
-    show('detail-card', true);
+    show('detail-modal', true);
     var account = run.account_name || run.account_id || '自动';
     var prediction = run.result
       ? (run.result.prediction_name || run.result.prediction || '—')
@@ -667,7 +667,10 @@
     $('history-refresh').addEventListener('click', function () { void loadHistory(); });
     $('settings-save').addEventListener('click', function () { void saveSettings(); });
     $('settings-reset').addEventListener('click', function () { void resetSettings(); });
-    $('detail-close').addEventListener('click', function () { show('detail-card', false); });
+    $('detail-close').addEventListener('click', function () { show('detail-modal', false); });
+    $('detail-modal').addEventListener('click', function (event) {
+      if (event.target === $('detail-modal')) show('detail-modal', false);
+    });
     $('history-body').addEventListener('click', function (event) {
       var target = event.target;
       if (!(target instanceof HTMLElement)) return;

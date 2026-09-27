@@ -56,9 +56,15 @@
           <p class="card-sub" id="run-sub"></p>
         </div>
         <div class="actions">
+          <button class="btn" id="resume-btn" type="button" hidden>继续检测</button>
           <button class="btn danger" id="cancel-btn" type="button">取消</button>
         </div>
       </header>
+      <div class="run-progress">
+        <progress id="run-progress" max="3" value="0" aria-label="已接受的挑战数"></progress>
+        <span id="run-progress-text" role="status"></span>
+      </div>
+      <p id="run-feedback" class="form-hint" role="status" hidden></p>
       <div class="queries" id="queries"></div>
       <div class="preview" id="response-preview" hidden>
         <h3 class="block-title">最近一次回答（预览）</h3>
@@ -74,6 +80,12 @@
         </div>
         <button class="btn" id="history-refresh" type="button">刷新</button>
       </header>
+      <div class="filters">
+        <label class="field"><span>搜索记录</span><input id="history-search" type="search" placeholder="模型、账号或 Key" /></label>
+        <label class="field"><span>运行状态</span><select id="history-status">
+          <option value="">全部状态</option><option value="active">未完成</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option>
+        </select></label>
+      </div>
       <div class="table-wrap">
         <table class="table compact">
           <thead>

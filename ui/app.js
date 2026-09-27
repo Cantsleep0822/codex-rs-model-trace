@@ -17,6 +17,7 @@
     challenges: null,
     run: null,
     busy: false,
+    driveGeneration: 0,
     stepInFlight: false,
     stepSentAt: 0,
     lastViewedRun: null,
@@ -25,7 +26,9 @@
     detailTab: 'meta',
     lastResult: null,
     settings: { challenge_count: 3, history_limit: 24, default_effort: null },
-    pollTimer: null,
+    pollFailures: 0,
+    needsPoll: false,
+    runMissing: false,
   };
 
   // 桥 invoke 超时是 30s，而管理调用最长约 120s；步骤调用可能先超时再由后端落盘。
@@ -78,7 +81,9 @@
     var data = decodeJsonBody(result);
     if (result.status < 200 || result.status >= 300) {
       var message = data && data.error ? String(data.error) : ('HTTP ' + result.status);
-      throw new Error(message);
+      var error = new Error(message);
+      error.status = result.status;
+      throw error;
     }
     return data;
   }
@@ -239,6 +244,7 @@
     if (!keyId || !model) return;
     var account = selectedAccount();
     state.busy = true;
+    state.driveGeneration += 1;
     refreshStartButton();
     try {
       state.challenges = trace.generateChallenges(state.settings.challenge_count);
@@ -259,6 +265,9 @@
       state.run = created.run;
       state.lastViewedRun = created.run;
       state.lastResult = null;
+      state.pollFailures = 0;
+      state.needsPoll = false;
+      state.runMissing = false;
       show('result-modal', false);
       refreshStartButton();
       toast('已创建检测任务，开始逐题调用模型。', 'ok');
@@ -272,7 +281,14 @@
 
   // 每轮只推进一道挑战；步骤调用超时后靠轮询恢复状态，超时才重发。
   async function drive() {
-    while (state.run && state.busy) {
+    var generation = ++state.driveGeneration;
+    var runId = state.run.id;
+    var current = function () {
+      return state.busy && state.driveGeneration === generation && state.run && state.run.id === runId;
+    };
+    state.stepInFlight = false;
+    state.stepSentAt = 0;
+    while (current()) {
       var run = state.run;
       if (['completed', 'cancelled', 'failed'].indexOf(run.status) >= 0) {
         renderRun(run);
@@ -291,55 +307,74 @@
         state.stepInFlight = true;
         state.stepSentAt = Date.now();
         call('POST', 'run/step', undefined, { id: run.id }).then(function (data) {
-          if (data && data.run) {
+          state.needsPoll = false;
+          if (current() && data && data.run && data.run.id === runId) {
             state.run = data.run;
             state.lastViewedRun = data.run;
             renderRun(data.run, data.response_text);
           }
         }).catch(function () {
-          // 步骤可能仍在后端执行（桥 30s 超时早于管理调用 120s 上限），交给轮询恢复。
+          // 桥 30s 超时早于管理调用上限；标记未确认，交给轮询恢复而不是重复发起。
+          if (current()) {
+            state.needsPoll = true;
+            renderRun(state.run);
+          }
         }).finally(function () {
-          state.stepInFlight = false;
+          if (current()) state.stepInFlight = false;
         });
       }
       await sleep(POLL_MS);
+      if (!current()) return;
       try {
-        var latest = await call('GET', 'run', 'id=' + encodeURIComponent(state.run.id));
-        if (latest && latest.run) {
+        var latest = await call('GET', 'run', 'id=' + encodeURIComponent(runId));
+        state.pollFailures = 0;
+        if (current() && latest && latest.run && latest.run.id === runId) {
+          if (!state.stepInFlight) state.needsPoll = false;
           state.run = latest.run;
           state.lastViewedRun = latest.run;
           renderRun(latest.run);
         }
       } catch (error) {
-        toast('状态刷新失败：' + error.message, 'fail');
+        if (!current()) return;
+        state.pollFailures += 1;
+        if (error.status === 404) {
+          state.runMissing = true;
+          state.busy = false;
+          renderRun(state.run);
+          refreshStartButton();
+          return;
+        }
+        renderRun(state.run);
+        if (state.pollFailures <= 2) toast('状态刷新失败：' + error.message, 'fail');
       }
     }
   }
 
   async function finishAttribution(run) {
+    var generation = state.driveGeneration;
+    var current = function () { return state.busy && state.driveGeneration === generation && state.run && state.run.id === run.id; };
     try {
       var outputs = run.queries.map(function (query) {
         return { expected_count: query.expected_count, numbers: query.numbers || [] };
       });
       var result = trace.analyzeGlobalOutputs(outputs, bank);
       var reported = await call('POST', 'run/report', undefined, { id: run.id, result: result });
+      if (!current()) return;
       state.run = reported.run || run;
       state.lastViewedRun = state.run;
       renderResult(result);
       renderRun(state.run);
       toast('归因完成：' + result.prediction_name + '（' + formatPercent(result.probability) + '）', 'ok');
     } catch (error) {
-      try {
-        var latest = await call('GET', 'run', 'id=' + encodeURIComponent(run.id));
-        state.run = latest.run || run;
-      } catch (_) { /* 保持原状态 */ }
-      state.run.status = 'failed';
-      renderRun(state.run);
-      toast('归因失败：' + error.message, 'fail');
+      if (!current()) return;
+      // 归因落盘失败不能伪造后端 failed 状态，保留 collecting 供用户继续。
+      toast('归因保存失败，可从历史继续：' + error.message, 'fail');
     } finally {
-      state.busy = false;
-      refreshStartButton();
-      loadHistory();
+      if (current()) {
+        state.busy = false;
+        refreshStartButton();
+        loadHistory();
+      }
     }
   }
 
@@ -354,9 +389,15 @@
 
   async function cancelRun() {
     if (!state.run) return;
+    var runId = state.run.id;
+    var generation = state.driveGeneration;
     try {
-      var data = await call('POST', 'run/cancel', undefined, { id: state.run.id });
+      var data = await call('POST', 'run/cancel', undefined, { id: runId });
+      if (!state.run || state.run.id !== runId || state.driveGeneration !== generation) return;
       state.run = data.run || state.run;
+      state.busy = false;
+      state.driveGeneration += 1;
+      refreshStartButton();
       renderRun(state.run);
       toast('已请求取消，正在进行的模型调用由宿主决定是否中断。', '');
     } catch (error) {
@@ -478,17 +519,25 @@
       toast('当前有检测进行中。', 'fail');
       return;
     }
+    state.busy = true;
+    state.driveGeneration += 1;
+    refreshStartButton();
     try {
       var data = await call('GET', 'run', 'id=' + encodeURIComponent(id));
       if (!data.run) throw new Error('运行不存在');
       var run = data.run;
       state.run = run;
       state.lastViewedRun = run;
+      state.pollFailures = 0;
+      state.needsPoll = false;
+      state.runMissing = false;
       renderRun(run);
       if (run.result) renderResult(run.result);
       var finished = ['completed', 'cancelled', 'failed'].includes(run.status);
       var allAccepted = run.queries.every(function (query) { return query.status === 'accepted'; });
       if (finished) {
+        state.busy = false;
+        refreshStartButton();
         return;
       }
       if (allAccepted) {
@@ -504,6 +553,8 @@
       void drive();
       toast('已接管未完成的检测。', 'ok');
     } catch (error) {
+      state.busy = false;
+      refreshStartButton();
       toast('打开运行失败：' + error.message, 'fail');
     }
   }
@@ -540,6 +591,15 @@
       + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
   }
 
+  function formatDuration(ms) {
+    if (ms == null || isNaN(ms) || ms < 0) return '—';
+    var seconds = Math.floor(ms / 1000);
+    if (seconds < 60) return seconds + ' 秒';
+    var minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + ' 分 ' + (seconds % 60) + ' 秒';
+    return Math.floor(minutes / 60) + ' 小时 ' + (minutes % 60) + ' 分';
+  }
+
   function formatPercent(value) {
     if (value === null || value === undefined || isNaN(value)) return '—';
     return (value * 100).toFixed(1) + '%';
@@ -552,7 +612,30 @@
     var keyLabel = run.client_key_name || run.client_key_id || '—';
     setText('run-sub', 'Key：' + keyLabel + ' · 账号：' + account + ' · 创建：' + formatTime(run.created_at_ms)
       + ' · 状态：' + run.status + (run.status_note ? '（' + run.status_note + '）' : ''));
-    $('cancel-btn').disabled = ['completed', 'cancelled', 'failed'].includes(run.status);
+    var total = run.queries.length;
+    var accepted = run.queries.filter(function (query) { return query.status === 'accepted'; }).length;
+    var runningQuery = run.queries.filter(function (query) { return query.status === 'running'; })[0];
+    var progressBar = $('run-progress');
+    progressBar.max = total;
+    progressBar.value = run.status === 'completed' ? total : accepted;
+    var elapsed = (run.completed_at_ms || Date.now()) - run.created_at_ms;
+    var parts = ['已完成 ' + accepted + '/' + total + ' 道挑战'];
+    if (runningQuery) parts.push('第 ' + (runningQuery.index + 1) + ' 题第 ' + (runningQuery.attempts.length || 1) + ' 次调用进行中');
+    if (run.status === 'collecting') parts.push('本地归因中');
+    parts.push('已耗时 ' + formatDuration(elapsed));
+    setText('run-progress-text', parts.join(' · '));
+    var feedback = '';
+    if (state.runMissing) feedback = '该任务记录已被删除，可从历史重新发起。';
+    else if (state.pollFailures > 0) feedback = '连接不稳定，轮询连续失败 ' + state.pollFailures + ' 次，仍在自动恢复。';
+    else if (state.needsPoll) feedback = '上一步调用结果未确认，正在通过轮询恢复，未重复发起模型调用。';
+    else if (run.status === 'interrupted') feedback = '检测曾中断，点击「继续检测」从已记账的尝试恢复，不额外调用未记账请求。';
+    var feedbackNode = $('run-feedback');
+    feedbackNode.hidden = !feedback;
+    feedbackNode.textContent = feedback;
+    var terminal = ['completed', 'cancelled', 'failed'].includes(run.status);
+    $('cancel-btn').disabled = terminal;
+    $('resume-btn').hidden = terminal || state.busy || state.runMissing;
+    if (!state.busy && !terminal) $('resume-btn').disabled = false;
     var container = $('queries');
     container.textContent = '';
     run.queries.forEach(function (query, index) {
@@ -648,15 +731,30 @@
     state.runsCache = runs;
     var body = $('history-body');
     body.innerHTML = '';
-    var limit = state.settings.history_limit || runs.length;
-    var shown = runs.slice(0, limit);
+    var keyword = ($('history-search').value || '').trim().toLowerCase();
+    var status = $('history-status').value;
+    var activeStatuses = ['pending', 'running', 'interrupted', 'collecting'];
+    var filtered = runs.filter(function (run) {
+      if (status === 'active' ? activeStatuses.indexOf(run.status) < 0
+        : status && run.status !== status) return false;
+      if (!keyword) return true;
+      var text = [run.model, run.client_key_name, run.client_key_id, run.account_name,
+        run.account_id, run.prediction].join(' ').toLowerCase();
+      return text.indexOf(keyword) >= 0;
+    });
+    var limit = state.settings.history_limit || filtered.length;
+    var shown = filtered.slice(0, limit);
     if (!shown.length) {
       state.detailRunId = null;
       state.detailRun = null;
-      body.innerHTML = '<tr><td colspan="7" class="empty">暂无记录</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="empty">'
+        + (runs.length ? '没有匹配的记录' : '暂无记录') + '</td></tr>';
+      setText('history-sub', '共 ' + runs.length + ' 次检测，筛选后无匹配。');
       return;
     }
-    setText('history-sub', '最近 ' + shown.length + ' / ' + runs.length + ' 次检测，点开可查看请求与回答明细。');
+    var label = '最近 ' + shown.length + ' / ' + filtered.length + ' 次检测';
+    if (keyword || status) label += '（已筛选，全部 ' + runs.length + ' 次）';
+    setText('history-sub', label + '，点开可查看请求与回答明细。');
     shown.forEach(function (run) {
       var row = document.createElement('tr');
       var expanded = state.detailRunId === run.id;
@@ -692,6 +790,13 @@
   async function deleteRun(id) {
     try {
       await call('POST', 'run/delete', undefined, { id: id });
+      if (state.run && state.run.id === id) {
+        state.driveGeneration += 1;
+        state.busy = false;
+        state.run = null;
+        show('run-card', false);
+        refreshStartButton();
+      }
       toast('已删除。', 'ok');
       loadHistory();
     } catch (error) {
@@ -712,6 +817,19 @@
     $('f-account').addEventListener('change', refreshStartButton);
     $('start-btn').addEventListener('click', function () { void startRun(); });
     $('cancel-btn').addEventListener('click', function () { void cancelRun(); });
+    $('resume-btn').addEventListener('click', function () {
+      if (state.run && !state.busy) {
+        state.busy = true;
+        state.pollFailures = 0;
+        state.runMissing = false;
+        refreshStartButton();
+        $('resume-btn').disabled = true;
+        void drive();
+      }
+    });
+    var filterApply = function () { renderHistory(state.runsCache || []); };
+    $('history-search').addEventListener('input', filterApply);
+    $('history-status').addEventListener('change', filterApply);
     $('history-refresh').addEventListener('click', function () { void loadHistory(); });
     $('settings-save').addEventListener('click', function () { void saveSettings(); });
     $('settings-reset').addEventListener('click', function () { void resetSettings(); });

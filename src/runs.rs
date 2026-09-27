@@ -214,35 +214,70 @@ pub async fn load_index(host: &HostClient) -> Vec<RunIndexEntry> {
         .unwrap_or_default()
 }
 
-/// 保存完整索引；调用方负责裁剪长度。
-pub async fn save_index_entries(
+/// 读改写重试，避免不同运行并发更新索引时互相覆盖丢条目。
+async fn update_index(
     host: &HostClient,
-    entries: &[RunIndexEntry],
+    mutate: impl Fn(&mut Vec<RunIndexEntry>) -> Vec<RunIndexEntry>,
 ) -> Result<(), PluginFault> {
-    let (_, version) = get_value(host, INDEX_KEY).await?.unwrap_or_default();
-    put_value(
-        host,
-        INDEX_KEY,
-        serde_json::json!({"entries": entries}),
-        (version != 0).then_some(version),
-    )
-    .await?;
-    Ok(())
+    for _ in 0..4 {
+        let (value, version) = get_value(host, INDEX_KEY).await?.unwrap_or_default();
+        // 索引已存在但损坏时跳过本次写，绝不以空内容覆盖原条目。
+        let mut entries: Vec<RunIndexEntry> = if value.is_null() {
+            Vec::new()
+        } else {
+            match value
+                .get("entries")
+                .cloned()
+                .and_then(|entries| serde_json::from_value(entries).ok())
+            {
+                Some(entries) => entries,
+                None => return Ok(()),
+            }
+        };
+        let evicted = mutate(&mut entries);
+        match put_value(
+            host,
+            INDEX_KEY,
+            serde_json::json!({"entries": entries}),
+            (version != 0).then_some(version),
+        )
+        .await
+        {
+            Ok(_) => {
+                for entry in evicted {
+                    delete_run_record(host, &entry.id).await;
+                }
+                return Ok(());
+            }
+            Err(error) if error.code == ErrorCode::Conflict => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "runs index kept conflicting",
+    ))
 }
 
 /// 追加/更新一条索引，失败不阻断运行（仅索引展示受影响）。
 /// 被裁掉的运行记录一并删除，避免长期累积超过命名空间记录上限。
 pub async fn touch_index(host: &HostClient, entry: RunIndexEntry) {
-    let mut entries = load_index(host).await;
-    entries.retain(|item| item.id != entry.id);
-    entries.insert(0, entry);
-    let evicted = entries.split_off(entries.len().min(MAX_INDEX_ENTRIES));
-    if save_index_entries(host, &entries).await.is_err() {
-        return;
-    }
-    for entry in evicted {
-        delete_run_record(host, &entry.id).await;
-    }
+    let entry = entry.clone();
+    let _ = update_index(host, |entries| {
+        entries.retain(|item| item.id != entry.id);
+        entries.insert(0, entry.clone());
+        entries.split_off(entries.len().min(MAX_INDEX_ENTRIES))
+    })
+    .await;
+}
+
+/// 从历史索引移除一条；索引删除失败向上报告，避免列表出现幽灵记录。
+pub async fn remove_index(host: &HostClient, id: &str) -> Result<(), PluginFault> {
+    update_index(host, |entries| {
+        entries.retain(|item| item.id != id);
+        Vec::new()
+    })
+    .await
 }
 
 /// 按当前版本删除一条运行记录；记录缺失或版本冲突时静默跳过。

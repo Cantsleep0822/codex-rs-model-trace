@@ -99,6 +99,7 @@ fn json_response(status: u16, body: serde_json::Value) -> ManagementResult {
     Ok(TypedReply::new(ManagementResponse {
         status,
         content_type: "application/json".to_owned(),
+        headers: Vec::new(),
     })
     .with_payload(serde_json::to_vec(&body).unwrap_or_default()))
 }
@@ -918,14 +919,12 @@ fn registration() -> ManagementRegistration {
 
 #[cfg(test)]
 mod tests {
-    use gateway_plugin_sdk::{Capability, Manifest, Permission};
+    use gateway_plugin_sdk::{Capability, Manifest};
 
     #[test]
     fn manifest_parses_and_declares_management() {
         let manifest = Manifest::from_author_slice(include_bytes!("../plugin.json")).unwrap();
-        assert_eq!(manifest.manifest_version, 1);
-        assert!(manifest.permissions.contains(&Permission::Models));
-        assert!(manifest.permissions.contains(&Permission::Accounts));
+        assert_eq!(manifest.manifest_version, 2);
         assert!(manifest.contributes.contains_key(&Capability::Management));
     }
 }

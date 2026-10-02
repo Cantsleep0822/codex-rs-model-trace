@@ -234,17 +234,7 @@ function renderAccountOptions() {
     );
     // Key 默认选第一个可用项，直接带出模型目录。
     if (state.keys.length) $('f-key').value = state.keys[0].id;
-    fillSelect(
-      $('f-account'),
-      state.accounts.map(function (account) {
-        // 优先显示真实身份：邮箱 > 用户名 > 上游用户 ID > 账号 ID。
-        var identity = account.email || account.name || account.upstream_user_id || account.account_id;
-        var label = identity
-          + '（' + account.provider_id + (account.enabled ? '' : '，已停用') + '）';
-        return { value: account.account_id, label: label };
-      }),
-      '自动（按 Key 调度）'
-    );
+    renderAccountOptions();
     await loadModels();
     hint('共 ' + state.accounts.length + ' 个上游账号；默认为自动调度。', '');
   }
@@ -855,6 +845,10 @@ function renderAccountOptions() {
       loadModels().then(refreshStartButton);
     });
     $('f-model').addEventListener('change', refreshStartButton);
+    $('f-account-search').addEventListener('input', function () {
+      renderAccountOptions();
+      refreshStartButton();
+    });
     $('f-account').addEventListener('change', refreshStartButton);
     $('start-btn').addEventListener('click', function () { void startRun(); });
     $('cancel-btn').addEventListener('click', function () { void cancelRun(); });

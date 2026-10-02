@@ -103,6 +103,47 @@
     });
   }
 
+function accountIdentity(account) {
+  return account.email || account.name || account.upstream_user_id || account.account_id;
+}
+
+function accountLabel(account) {
+  return accountIdentity(account)
+    + '（' + account.provider_id + (account.enabled ? '' : '，已停用') + '）';
+}
+
+function renderAccountOptions() {
+  var select = $('f-account');
+  var selected = select.value;
+  var keyword = ($('f-account-search').value || '').trim().toLowerCase();
+
+  var accounts = state.accounts.filter(function (account) {
+    if (!keyword) return true;
+    var searchable = [
+      account.email,
+      account.name,
+      account.upstream_user_id,
+      account.account_id,
+      account.provider_id
+    ].join(' ').toLowerCase();
+    return searchable.indexOf(keyword) >= 0;
+  });
+
+  fillSelect(
+    select,
+    accounts.map(function (account) {
+      return { value: account.account_id, label: accountLabel(account) };
+    }),
+    '自动（按 Key 调度）'
+  );
+
+  if (selected && accounts.some(function (account) {
+    return account.account_id === selected;
+  })) {
+    select.value = selected;
+  }
+}
+
   function hint(message, kind) {
     var node = $('start-hint');
     node.textContent = message;

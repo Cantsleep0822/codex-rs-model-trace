@@ -10,7 +10,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "gateway-plugin-sdk"
-version = "0.2.0"
+version = "0.1.0"
 source = "git+https://github.com/zyycn/codex-proxy-rs.git?rev=f5a0ea1d4a9e137e311db4a5995066c50cb5f46d#f5a0ea1d4a9e137e311db4a5995066c50cb5f46d"
 dependencies = [
  "semver",
@@ -34,7 +34,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "model-trace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gateway-plugin-sdk",
  "serde",

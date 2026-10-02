@@ -3,7 +3,7 @@
 codex-proxy-rs 的管理端插件：选择执行 Key、上游账号与模型，向目标模型发送
 1–3 条长整数挑战，解析回答中的数字序列，并在页面本地按
 [ModelTrace](https://xqy2006.github.io/ModelTrace/) 统一指纹库做模型归因。
-当前插件要求 codex-proxy-rs v3.19.0 或更高版本。
+当前插件要求 codex-proxy-rs v3.19.0 及以上更高版本。
 
 ## 能力
 
